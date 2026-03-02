@@ -397,6 +397,10 @@ static nex_status_t lz_deserialize(const uint8_t *data, size_t size,
     uint32_t count;
     memcpy(&count, p, 4); p += 4;
 
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (*original_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+    if (count > (64 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+
     nex_status_t st = lz_seq_init(seq, count > 0 ? count : 256);
     if (st != NEX_OK) return st;
 

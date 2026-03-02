@@ -26,7 +26,7 @@ static void print_usage(const char *prog) {
         "  max       LZ optimal parse + rANS    (best ratio)\n"
         "  bwt       BWT + MTF + RLE + rANS     (text data)\n"
         "  balanced  LZ lazy match + rANS       (general purpose)\n"
-        "  fast      LZ greedy + Huffman        (speed priority)\n"
+        "  fast      LZ4-style single-pass     (speed priority)\n"
         "  store     Raw copy                   (incompressible)\n\n"
         "Examples:\n"
         "  %s -c file.txt -o file.nex         Compress\n"

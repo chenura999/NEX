@@ -134,13 +134,29 @@ nex_status_t nex_lz_fast_compress(const uint8_t *in, size_t in_size,
 
         /* ── Found a match! ── */
 
-        /* Extend match forward */
+        /* Extend match forward — 8 bytes at a time (LZ4-style) */
         size_t match_len = 4;
         size_t max_extend = (size_t)(in_end - ip);
         if (max_extend > LZF_MAX_DISTANCE) max_extend = LZF_MAX_DISTANCE;
+
+        /* Fast 8-byte chunk comparison */
+        while (match_len + 8 <= max_extend) {
+            uint64_t diff;
+            memcpy(&diff, ip + match_len, 8);
+            uint64_t refd;
+            memcpy(&refd, ref + match_len, 8);
+            diff ^= refd;
+            if (diff) {
+                match_len += __builtin_ctzll(diff) >> 3;
+                goto match_done;
+            }
+            match_len += 8;
+        }
+        /* Tail bytes */
         while (match_len < max_extend && ip[match_len] == ref[match_len]) {
             match_len++;
         }
+        match_done:
 
         /* Emit literal run + match */
         size_t lit_len = (size_t)(ip - lit_start);
@@ -279,15 +295,20 @@ nex_status_t nex_lz_fast_decompress(const uint8_t *in, size_t in_size,
             match_len += lzf_read_count(&ip, in_end);
         }
 
-        /* Copy match (may overlap) */
+        /* Copy match — use memcpy for non-overlapping, byte loop for overlap */
         uint8_t *match_src = op - offset;
         if (match_src < out->data || op + match_len > out_end) {
             return NEX_ERR_CORRUPT;
         }
 
-        /* Byte-by-byte copy for overlapping matches */
-        for (size_t i = 0; i < match_len; i++) {
-            op[i] = match_src[i];
+        if (offset >= match_len) {
+            /* Non-overlapping: fast memcpy */
+            memcpy(op, match_src, match_len);
+        } else {
+            /* Overlapping: byte-by-byte (e.g. run-length encoded data) */
+            for (size_t i = 0; i < match_len; i++) {
+                op[i] = match_src[i];
+            }
         }
         op += match_len;
     }

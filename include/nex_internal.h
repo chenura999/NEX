@@ -23,7 +23,7 @@
 
 /* ── Constants ───────────────────────────────────────────────────── */
 #define NEX_MAGIC         0x0158454EU  /* "NEX\x01" LE              */
-#define NEX_FOOTER_MAGIC  0x0158454EU  /* "XEN\x01" LE (reversed)   */
+#define NEX_FOOTER_MAGIC  0x014E4558U  /* "XEN\x01" LE              */
 #define NEX_FORMAT_VER    1
 #define NEX_FLAG_MICRO    0x0001       /* Sub-1KB micro header flag */
 

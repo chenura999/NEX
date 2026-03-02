@@ -246,6 +246,9 @@ nex_status_t nex_rans_decompress(const uint8_t *in, size_t in_size,
     memcpy(&orig_size, ip, 4); ip += 4;
     memcpy(&enc_size, ip, 4); ip += 4;
 
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+
     /* Read frequency table */
     rans_freq_table_t ft;
     for (int i = 0; i < 256; i++) {
@@ -515,6 +518,9 @@ nex_status_t nex_huffman_decompress(const uint8_t *in, size_t in_size,
     uint32_t orig_size, total_bits;
     memcpy(&orig_size, ip, 4); ip += 4;
     memcpy(&total_bits, ip, 4); ip += 4;
+
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
 
     /* Read code lengths */
     uint8_t lengths[256];

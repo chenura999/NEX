@@ -18,10 +18,10 @@ extern "C" {
 #endif
 
 /* ── Version ──────────────────────────────────────────────────────── */
-#define NEX_VERSION_MAJOR  1
+#define NEX_VERSION_MAJOR  2
 #define NEX_VERSION_MINOR  0
 #define NEX_VERSION_PATCH  0
-#define NEX_VERSION_STRING "1.0.0"
+#define NEX_VERSION_STRING "2.0.0"
 
 /* ── Error Codes ─────────────────────────────────────────────────── */
 typedef enum {
@@ -43,7 +43,7 @@ typedef enum {
     NEX_PIPE_MAX      = 1,  /* LZ optimal + rANS (best ratio)  */
     NEX_PIPE_BWT      = 2,  /* BWT + MTF + RLE + rANS (text)   */
     NEX_PIPE_BALANCED = 3,  /* LZ lazy + rANS (general)        */
-    NEX_PIPE_FAST     = 4,  /* LZ greedy + Huffman (speed)     */
+    NEX_PIPE_FAST     = 4,  /* LZ4-style single-pass (speed)   */
     NEX_PIPE_EXEC     = 5,  /* BCJ + LZ optimal + rANS (exec)  */
     NEX_PIPE_STORE    = 6,  /* Raw copy (incompressible)       */
     NEX_PIPE_COUNT    = 7,

@@ -160,6 +160,9 @@ nex_status_t nex_bwt_inverse(const uint8_t *in, size_t in_size,
     memcpy(&orig_size, in, 4);
     memcpy(&primary_idx, in + 4, 4);
 
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+
     const uint8_t *bwt = in + 8;
     size_t n = orig_size;
 
@@ -303,6 +306,9 @@ nex_status_t nex_mtf_rle_decode(const uint8_t *in, size_t in_size,
     uint32_t orig_size;
     memcpy(&orig_size, in, 4);
 
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+
     if (out->capacity < orig_size) {
         uint8_t *new_data = (uint8_t *)realloc(out->data, orig_size);
         if (!new_data) return NEX_ERR_NOMEM;
@@ -388,6 +394,9 @@ nex_status_t nex_delta_decode(const uint8_t *in, size_t in_size,
 
     uint32_t orig_size;
     memcpy(&orig_size, in, 4);
+
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
 
     if (in_size < 4 + orig_size) return NEX_ERR_CORRUPT;
 
