@@ -118,13 +118,11 @@ nex_status_t nex_compress(const uint8_t *input, size_t input_size,
     /* V2 Industrial Upgrade: Dynamic Macro-Scale Windows */
     if (chunk_size == NEX_DEFAULT_CHUNK_SIZE) {
         if (cfg->level <= 3) {
-            chunk_size = 1 * 1024 * 1024;       /* 1MB */
+            chunk_size = 4 * 1024 * 1024;       /* 4MB — max parallelism */
         } else if (cfg->level <= 6) {
             chunk_size = 8 * 1024 * 1024;       /* 8MB */
-        } else if (cfg->level <= 8) {
-            chunk_size = 32 * 1024 * 1024;      /* 32MB */
         } else {
-            chunk_size = 128 * 1024 * 1024;     /* 128MB */
+            chunk_size = 16 * 1024 * 1024;      /* 16MB — balance ratio + threads */
         }
     }
 

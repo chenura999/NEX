@@ -140,7 +140,7 @@ nex_status_t nex_pipeline_compress(nex_pipeline_id_t id,
 
         /* Determine effective level for this stage */
         int stage_level = level;
-        if (id == NEX_PIPE_FAST) stage_level = NEX_MIN(level, 2);
+        if (id == NEX_PIPE_FAST) stage_level = NEX_MIN(level, 4);
         else if (id == NEX_PIPE_MAX) stage_level = NEX_MAX(level, 7);
 
         st = pipe->compress_stages[i](cur_in, cur_size, cur_out, stage_level, dict, dict_size);

@@ -15,63 +15,62 @@
  *   [N bytes] BWT output
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Suffix Array via Prefix Doubling + qsort ────────────────────── */
+/* ── Suffix Array via Radix Prefix Doubling: O(n log n) ──────── */
 
-/* Thread-local context for qsort comparator */
-static _Thread_local int *g_sa_rank = NULL;
-static _Thread_local int  g_sa_k    = 0;
-static _Thread_local int  g_sa_n    = 0;
+/* O(n) Stable Radix Sort Pass */
+static void radix_pass(int *sa_in, int *sa_out, const int *rank, int offset, int n, int K) {
+    int *count = (int *)calloc(K + 2, sizeof(int));
+    if (!count) return;
 
-static int sa_cmp_fn(const void *a, const void *b) {
-    int i = *(const int *)a;
-    int j = *(const int *)b;
+    for (int i = 0; i < n; i++) {
+        int r = rank[(sa_in[i] + offset) % n];
+        count[r + 1]++;
+    }
 
-    if (g_sa_rank[i] != g_sa_rank[j])
-        return (g_sa_rank[i] < g_sa_rank[j]) ? -1 : 1;
+    for (int i = 1; i <= K; i++) {
+        count[i] += count[i - 1];
+    }
 
-    /* Use modular indexing for ROTATION ordering (not suffix ordering) */
-    int ri = g_sa_rank[(i + g_sa_k) % g_sa_n];
-    int rj = g_sa_rank[(j + g_sa_k) % g_sa_n];
+    for (int i = 0; i < n; i++) {
+        int r = rank[(sa_in[i] + offset) % n];
+        sa_out[count[r]++] = sa_in[i];
+    }
 
-    if (ri != rj)
-        return (ri < rj) ? -1 : 1;
-    return 0;
+    free(count);
 }
 
 static void build_suffix_array(const uint8_t *data, size_t n,
                                 uint32_t *sa_out) {
     int nn = (int)n;
 
-    /* Work entirely with int arrays */
     int *sa   = (int *)malloc(nn * sizeof(int));
     int *rank = (int *)malloc(nn * sizeof(int));
     int *tmp  = (int *)malloc(nn * sizeof(int));
+    int *tmp_sa = (int *)malloc(nn * sizeof(int));
 
-    if (!sa || !rank || !tmp) {
+    if (!sa || !rank || !tmp || !tmp_sa) {
         for (int i = 0; i < nn; i++) sa_out[i] = (uint32_t)i;
-        free(sa); free(rank); free(tmp);
+        free(sa); free(rank); free(tmp); free(tmp_sa);
         return;
     }
 
     /* Initialize SA and ranks */
+    int K = 255;
     for (int i = 0; i < nn; i++) {
         sa[i] = i;
         rank[i] = (int)data[i];
     }
 
-    /* Set globals for comparator */
-    g_sa_rank = rank;
-    g_sa_n    = nn;
-
     for (int k = 1; k < nn; k <<= 1) {
-        g_sa_k = k;
-
-        qsort(sa, (size_t)nn, sizeof(int), sa_cmp_fn);
+        /* Radix Sort in 2 passes: Low half (rank[i+k]), then High half (rank[i]) */
+        radix_pass(sa, tmp_sa, rank, k, nn, K);
+        radix_pass(tmp_sa, sa, rank, 0, nn, K);
 
         /* Recompute ranks based on sorted order */
         tmp[sa[0]] = 0;
+        int current_k = 0;
         for (int i = 1; i < nn; i++) {
-            int p = sa[i - 1];  /* previous suffix */
+            int p = sa[i - 1];
             int c = sa[i];      /* current suffix */
 
             int pr1 = rank[p];
@@ -79,15 +78,17 @@ static void build_suffix_array(const uint8_t *data, size_t n,
             int cr1 = rank[c];
             int cr2 = rank[(c + k) % nn];
 
-            if (cr1 == pr1 && cr2 == pr2)
+            if (cr1 == pr1 && cr2 == pr2) {
                 tmp[c] = tmp[p];
-            else
+            } else {
                 tmp[c] = tmp[p] + 1;
+                current_k++;
+            }
         }
 
         /* Swap rank and tmp */
         memcpy(rank, tmp, nn * sizeof(int));
-        g_sa_rank = rank;
+        K = current_k;
 
         /* All ranks unique → done */
         if (rank[sa[nn - 1]] == nn - 1) break;
@@ -97,10 +98,10 @@ static void build_suffix_array(const uint8_t *data, size_t n,
     for (int i = 0; i < nn; i++)
         sa_out[i] = (uint32_t)sa[i];
 
-    g_sa_rank = NULL;
     free(sa);
     free(rank);
     free(tmp);
+    free(tmp_sa);
 }
 
 nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
