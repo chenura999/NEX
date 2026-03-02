@@ -74,7 +74,7 @@ nex_status_t nex_lz_fast_compress(const uint8_t *in, size_t in_size,
     }
 
     /* Worst case: 4-byte header + slightly expanded data */
-    size_t max_out = 4 + in_size + (in_size / 255) + 16;
+    size_t max_out = 4 + in_size + (in_size / 255) + 64;
     if (out->capacity < max_out) {
         uint8_t *new_data = (uint8_t *)realloc(out->data, max_out);
         if (!new_data) return NEX_ERR_NOMEM;
@@ -83,14 +83,15 @@ nex_status_t nex_lz_fast_compress(const uint8_t *in, size_t in_size,
     }
 
     /* Hash table — positions of 4-byte hashes */
-    uint32_t *htable = (uint32_t *)calloc(LZF_HASH_SIZE, sizeof(uint32_t));
+    uint32_t *htable = (uint32_t *)malloc(LZF_HASH_SIZE * sizeof(uint32_t));
     if (!htable) return NEX_ERR_NOMEM;
     memset(htable, 0xFF, LZF_HASH_SIZE * sizeof(uint32_t));
 
     uint8_t *op = out->data;
     const uint8_t *ip = in;
     const uint8_t *in_end = in + in_size;
-    const uint8_t *match_limit = in_end - 5; /* need 5 bytes for safe read */
+    /* Need at least 5 bytes remaining for safe 4-byte hash read + match check */
+    const uint8_t *match_limit = (in_size >= 5) ? (in_end - 5) : in;
     const uint8_t *lit_start = ip;
 
     /* Write original size header */
@@ -227,6 +228,9 @@ nex_status_t nex_lz_fast_decompress(const uint8_t *in, size_t in_size,
     uint32_t orig_size;
     memcpy(&orig_size, ip, 4);
     ip += 4;
+
+    /* Sanity check: reject absurdly large sizes (DoS prevention) */
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
 
     if (out->capacity < orig_size) {
         uint8_t *new_data = (uint8_t *)realloc(out->data, orig_size);

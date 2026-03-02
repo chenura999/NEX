@@ -25,7 +25,7 @@ static const uint8_t sig_bz2[]  = {0x42, 0x5A, 0x68};
 static const uint8_t sig_elf[]  = {0x7F, 0x45, 0x4C, 0x46};
 static const uint8_t sig_pe[]   = {0x4D, 0x5A};
 static const uint8_t sig_pdf[]  = {0x25, 0x50, 0x44, 0x46};
-static const uint8_t sig_mp4[]  = {0x00, 0x00, 0x00};  /* ftyp at +4 */
+static const uint8_t sig_mp4[]  __attribute__((unused)) = {0x00, 0x00, 0x00};  /* ftyp at +4 — needs offset check, too generic for prefix match */
 static const uint8_t sig_flac[] = {0x66, 0x4C, 0x61, 0x43};
 
 static const nex_signature_t signatures[] = {

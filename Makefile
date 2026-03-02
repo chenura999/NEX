@@ -56,5 +56,3 @@ bench: $(TARGET)
 		./$(TARGET) -b $(FILE); \
 	fi
 
-clean:
-	rm -rf $(OBJDIR) $(TARGET) tests/test_units *.nex *.out
