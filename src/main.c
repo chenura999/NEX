@@ -19,7 +19,7 @@ static void print_usage(const char *prog) {
         "  -t, --threads N        Thread count (0 = auto, default: auto)\n"
         "  -p, --pipeline NAME    Force pipeline: max|bwt|balanced|fast|store\n"
         "  -b, --benchmark        Benchmark mode\n"
-        "  -o, --output FILE      Output file\n"
+        "  -D, --dict FILE        Use dictionary file for compression/decompression\n"
         "  -v, --verbose          Verbose output\n"
         "  -h, --help             Show this help\n\n"
         "Pipelines:\n"
@@ -139,7 +139,7 @@ static void run_benchmark(const char *input_path, const nex_config_t *cfg) {
         /* Decompress */
         nex_buffer_t decompressed = {0};
         st = nex_decompress(compressed.data, compressed.size,
-                             &decompressed, &decomp_stats);
+                             &decompressed, cfg, &decomp_stats);
 
         if (st == NEX_OK) {
             /* Verify */
@@ -169,8 +169,15 @@ static void run_benchmark(const char *input_path, const nex_config_t *cfg) {
 
     /* Auto-selected pipeline info */
     nex_pipeline_id_t auto_pipe = nex_select_pipeline(&profile, cfg->level);
+    const char *auto_name = "unknown";
+    for (int i = 0; i < 5; i++) {
+        if (pipes[i] == auto_pipe) {
+            auto_name = pipe_names[i];
+            break;
+        }
+    }
     printf("\n  Auto-selected pipeline: %s (level %d)\n\n",
-           pipe_names[auto_pipe - 1], cfg->level);
+           auto_name, cfg->level);
 
     free(data);
 }
@@ -189,6 +196,7 @@ int main(int argc, char *argv[]) {
     bool benchmark_mode = false;
     const char *output_path = NULL;
     const char *input_path = NULL;
+    const char *dict_path = NULL;
 
     static struct option long_options[] = {
         {"compress",   no_argument,       0, 'c'},
@@ -198,13 +206,14 @@ int main(int argc, char *argv[]) {
         {"pipeline",   required_argument, 0, 'p'},
         {"benchmark",  no_argument,       0, 'b'},
         {"output",     required_argument, 0, 'o'},
+        {"dict",       required_argument, 0, 'D'},
         {"verbose",    no_argument,       0, 'v'},
         {"help",       no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "cdl:t:p:bo:vh",
+    while ((opt = getopt_long(argc, argv, "cdl:t:p:bo:D:vh",
                                long_options, NULL)) != -1) {
         switch (opt) {
             case 'c': decompress_mode = false; break;
@@ -218,6 +227,7 @@ int main(int argc, char *argv[]) {
             case 'p': cfg.pipeline = parse_pipeline(optarg); break;
             case 'b': benchmark_mode = true; break;
             case 'o': output_path = optarg; break;
+            case 'D': dict_path = optarg; break;
             case 'v': cfg.verbose = true; break;
             case 'h': print_usage(argv[0]); return 0;
             default: print_usage(argv[0]); return 1;
@@ -234,9 +244,34 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    if (dict_path) {
+        FILE *df = fopen(dict_path, "rb");
+        if (!df) {
+            fprintf(stderr, "Error: cannot open dictionary file '%s'\n", dict_path);
+            return 1;
+        }
+        fseek(df, 0, SEEK_END);
+        long dsize = ftell(df);
+        fseek(df, 0, SEEK_SET);
+        if (dsize > 0) {
+            uint8_t *dbuf = (uint8_t *)malloc(dsize);
+            if (dbuf && fread(dbuf, 1, dsize, df) == (size_t)dsize) {
+                cfg.dict_data = dbuf;
+                cfg.dict_size = dsize;
+            } else {
+                free(dbuf);
+                fprintf(stderr, "Error: failed to read dictionary\n");
+                fclose(df);
+                return 1;
+            }
+        }
+        fclose(df);
+    }
+
     /* Benchmark mode */
     if (benchmark_mode) {
         run_benchmark(input_path, &cfg);
+        if (cfg.dict_data) free((void *)cfg.dict_data);
         return 0;
     }
 
@@ -266,7 +301,7 @@ int main(int argc, char *argv[]) {
         if (cfg.verbose) {
             printf("Decompressing: %s → %s\n", input_path, output_path);
         }
-        st = nex_decompress_file(input_path, output_path, &stats);
+        st = nex_decompress_file(input_path, output_path, &cfg, &stats);
 
         if (st == NEX_OK) {
             if (cfg.verbose) print_stats(&stats, false);
@@ -294,8 +329,10 @@ int main(int argc, char *argv[]) {
 
     if (st != NEX_OK) {
         fprintf(stderr, "Error: %s\n", nex_strerror(st));
+        if (cfg.dict_data) free((void *)cfg.dict_data);
         return 1;
     }
 
+    if (cfg.dict_data) free((void *)cfg.dict_data);
     return 0;
 }

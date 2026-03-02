@@ -1,0 +1,74 @@
+mkdir -p build
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/analyzer.c -o build/analyzer.o
+src/analyzer.c:28:22: warning: ‘sig_mp4’ defined but not used [-Wunused-const-variable=]
+   28 | static const uint8_t sig_mp4[]  = {0x00, 0x00, 0x00};  /* ftyp at +4 */
+      |                      ^~~~~~~
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/container.c -o build/container.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/decompress.c -o build/decompress.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/entropy.c -o build/entropy.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/lz_match.c -o build/lz_match.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/main.c -o build/main.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/memory.c -o build/memory.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/parallel.c -o build/parallel.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/pipeline.c -o build/pipeline.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/transform.c -o build/transform.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG -c src/xxhash.c -o build/xxhash.o
+gcc build/analyzer.o build/container.o build/decompress.o build/entropy.o build/lz_match.o build/main.o build/memory.o build/parallel.o build/pipeline.o build/transform.o build/xxhash.o -o nexc -lpthread -lm -fsanitize=address,undefined
+=== Running unit tests ===
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -g -fsanitize=address,undefined -DNEX_DEBUG tests/test_units.c build/analyzer.o build/container.o build/decompress.o build/entropy.o build/lz_match.o build/memory.o build/parallel.o build/pipeline.o build/transform.o build/xxhash.o -o tests/test_units -lpthread -lm -fsanitize=address,undefined
+./tests/test_units
+=================================================================
+==927313==ERROR: AddressSanitizer: unknown-crash on address 0x7b324fe0109d at pc 0x555a82902812 bp 0x7ffeb3b183f0 sp 0x7ffeb3b183e0
+READ of size 4 at 0x7b324fe0109d thread T0
+    #0 0x555a82902811 in lz_hash4 src/lz_match.c:27
+    #1 0x555a82902811 in lz_find_match src/lz_match.c:87
+    #2 0x555a82903007 in nex_lz_compress src/lz_match.c:341
+    #3 0x555a828e9bc7 in test_lz tests/test_units.c:117
+    #4 0x555a828e5413 in main tests/test_units.c:401
+    #5 0x7f3251e276c0  (/usr/lib/libc.so.6+0x276c0) (BuildId: be6002fa4876d5551ebbfd354c20416871ac9e7e)
+    #6 0x7f3251e277f8 in __libc_start_main (/usr/lib/libc.so.6+0x277f8) (BuildId: be6002fa4876d5551ebbfd354c20416871ac9e7e)
+    #7 0x555a828e9604 in _start (/home/alonexe/Documents/NEX/tests/test_units+0x39604) (BuildId: ecceef6bbda56371d78cfbe517b36d5bbe419e4a)
+
+Address 0x7b324fe0109d is located in stack of thread T0 at offset 4253 in frame
+    #0 0x555a828e96ef in test_lz tests/test_units.c:89
+
+  This frame has 3 object(s):
+    [32, 56) 'compressed' (line 96)
+    [96, 120) 'decompressed' (line 96)
+    [160, 4256) 'large' (line 111) <== Memory access at offset 4253 partially overflows this variable
+HINT: this may be a false positive if your program uses some custom stack unwind mechanism, swapcontext or vfork
+      (longjmp and C++ exceptions *are* supported)
+SUMMARY: AddressSanitizer: unknown-crash src/lz_match.c:27 in lz_hash4
+Shadow bytes around the buggy address:
+  0x7b324fe00e00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe00e80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe00f00: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe00f80: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe01000: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+=>0x7b324fe01080: 00 00 00[00]f3 f3 f3 f3 f3 f3 f3 f3 f3 f3 f3 f3
+  0x7b324fe01100: f3 f3 f3 f3 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe01180: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe01200: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe01280: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  0x7b324fe01300: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+Shadow byte legend (one shadow byte represents 8 application bytes):
+  Addressable:           00
+  Partially addressable: 01 02 03 04 05 06 07 
+  Heap left redzone:       fa
+  Freed heap region:       fd
+  Stack left redzone:      f1
+  Stack mid redzone:       f2
+  Stack right redzone:     f3
+  Stack after return:      f5
+  Stack use after scope:   f8
+  Global redzone:          f9
+  Global init order:       f6
+  Poisoned by user:        f7
+  Container overflow:      fc
+  Array cookie:            ac
+  Intra object redzone:    bb
+  ASan internal:           fe
+  Left alloca redzone:     ca
+  Right alloca redzone:    cb
+==927313==ABORTING
+make: *** [Makefile:35: test] Error 1

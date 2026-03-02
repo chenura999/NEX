@@ -1,0 +1,197 @@
+mkdir -p build
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/analyzer.c -o build/analyzer.o
+src/analyzer.c:28:22: warning: ‘sig_mp4’ defined but not used [-Wunused-const-variable=]
+   28 | static const uint8_t sig_mp4[]  = {0x00, 0x00, 0x00};  /* ftyp at +4 */
+      |                      ^~~~~~~
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/container.c -o build/container.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/decompress.c -o build/decompress.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/entropy.c -o build/entropy.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/lz_match.c -o build/lz_match.o
+src/lz_match.c:211:13: warning: ‘lz_bt4_skip’ defined but not used [-Wunused-function]
+  211 | static void lz_bt4_skip(lz_match_finder_t *mf, size_t pos) {
+      |             ^~~~~~~~~~~
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/main.c -o build/main.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/memory.c -o build/memory.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/parallel.c -o build/parallel.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/pipeline.c -o build/pipeline.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/transform.c -o build/transform.o
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG -c src/xxhash.c -o build/xxhash.o
+gcc build/analyzer.o build/container.o build/decompress.o build/entropy.o build/lz_match.o build/main.o build/memory.o build/parallel.o build/pipeline.o build/transform.o build/xxhash.o -o nexc -lpthread -lm
+=== Running unit tests ===
+gcc -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE -DNDEBUG tests/test_units.c build/analyzer.o build/container.o build/decompress.o build/entropy.o build/lz_match.o build/memory.o build/parallel.o build/pipeline.o build/transform.o build/xxhash.o -o tests/test_units -lpthread -lm
+./tests/test_units
+╔══════════════════════════════════════════════╗
+║        NEX Compress — Unit Test Suite        ║
+╚══════════════════════════════════════════════╝
+
+=== XXHash Tests ===
+  ✓ PASS: XXH32 empty string
+  ✓ PASS: XXH32 single char non-zero
+  ✓ PASS: XXH32 deterministic
+  ✓ PASS: XXH64 deterministic
+  ✓ PASS: XXH32 different seeds differ
+
+=== Analyzer Tests ===
+  ✓ PASS: Text detection
+  ✓ PASS: Text ratio > 90%
+  ✓ PASS: Text is compressible
+  ✓ PASS: Random data high entropy
+  ✓ PASS: All-zero data near-zero entropy
+  ✓ PASS: Zero data is compressible
+  ✓ PASS: Text level 6 → balanced
+  ✓ PASS: Level 1 → fast
+
+=== Memory Tests ===
+  ✓ PASS: Arena alloc 100 bytes
+  ✓ PASS: Arena alloc 200 bytes
+  ✓ PASS: Arena alloc 2000 bytes (new block)
+  ✓ PASS: Available memory > 0
+  Available memory: 7057 MB
+
+=== LZ Matching Tests ===
+  ✓ PASS: LZ compress ok
+  ✓ PASS: LZ decompress ok
+  ✓ PASS: LZ size matches
+  ✓ PASS: LZ data matches
+  ✓ PASS: LZ compress 4KB ok
+  ✓ PASS: LZ decompress 4KB ok
+  ✓ PASS: LZ 4KB size matches
+  ✓ PASS: LZ 4KB data matches
+
+=== BWT Tests ===
+  ✓ PASS: BWT forward ok
+  ✓ PASS: BWT inverse ok
+  ✓ PASS: BWT size matches
+  ✓ PASS: BWT round-trip matches
+  ✓ PASS: BWT forward longer ok
+  ✓ PASS: BWT inverse longer ok
+  ✓ PASS: BWT longer size matches
+  ✓ PASS: BWT longer round-trip
+
+=== Delta Encoding Tests ===
+  ✓ PASS: Delta encode ok
+  ✓ PASS: Delta decode ok
+  ✓ PASS: Delta size matches
+  ✓ PASS: Delta round-trip matches
+
+=== rANS Entropy Tests ===
+  ✓ PASS: rANS compress ok
+  ✓ PASS: rANS decompress ok
+  ✓ PASS: rANS size matches
+  ✓ PASS: rANS round-trip
+  ✓ PASS: rANS compress 2KB ok
+  ✓ PASS: rANS decompress 2KB ok
+  ✓ PASS: rANS 2KB size matches
+  ✓ PASS: rANS 2KB round-trip
+
+=== Container Tests ===
+  ✓ PASS: Write header ok
+  ✓ PASS: Header is 30 bytes
+  ✓ PASS: Read header ok
+  ✓ PASS: Version matches
+  ✓ PASS: Size matches
+  ✓ PASS: Chunk count matches
+  ✓ PASS: Checksum matches
+  ✓ PASS: Write chunk table ok
+  ✓ PASS: Chunk table is 42 bytes (2 × 21)
+  ✓ PASS: Read chunk table ok
+  ✓ PASS: Entry 0 size matches
+  ✓ PASS: Entry 1 pipeline matches
+
+=== Pipeline Tests ===
+  ✓ PASS: Pipeline balanced compress ok
+  ✓ PASS: Pipeline balanced decompress ok
+  ✓ PASS: Pipeline balanced round-trip
+  ✓ PASS: Pipeline fast compress ok
+  ✓ PASS: Pipeline fast decompress ok
+  ✓ PASS: Pipeline fast round-trip
+  ✓ PASS: Pipeline max compress ok
+  ✓ PASS: Pipeline max decompress ok
+  ✓ PASS: Pipeline max round-trip
+  ✓ PASS: Pipeline store compress ok
+  ✓ PASS: Pipeline store decompress ok
+  ✓ PASS: Pipeline store round-trip
+
+=== Full API Tests ===
+  ✓ PASS: Full compress ok
+  ✓ PASS: Stats original size
+  ✓ PASS: Stats compressed size
+  ✓ PASS: Stats ratio reasonable
+  ✓ PASS: Full decompress ok
+  ✓ PASS: Decompressed size matches
+  ✓ PASS: Decompressed data matches
+
+══════════════════════════════════════════════
+  Results: 76/76 passed
+══════════════════════════════════════════════
+=== Running round-trip tests ===
+bash tests/test_roundtrip.sh
+══════════════════════════════════════════════
+  NEX Compress — Round-Trip Test Suite
+══════════════════════════════════════════════
+
+Creating test data...
+
+--- Auto Pipeline ---
+Compressed: /tmp/tmp.fUMfmfV04X/small.txt → /tmp/tmp.fUMfmfV04X/test.nex (2075.9%, 0.3 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (29 bytes)
+✓ PASS: Small text / auto
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (4.6%, 1.6 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Repeated text / auto
+Compressed: /tmp/tmp.fUMfmfV04X/binary.bin → /tmp/tmp.fUMfmfV04X/test.nex (101.1%, 109.6 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (5120 bytes)
+✓ PASS: Binary / auto
+Compressed: /tmp/tmp.fUMfmfV04X/random.bin → /tmp/tmp.fUMfmfV04X/test.nex (100.2%, 446.6 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (32768 bytes)
+✓ PASS: Random / auto
+Compressed: /tmp/tmp.fUMfmfV04X/single.txt → /tmp/tmp.fUMfmfV04X/test.nex (58000.0%, 0.0 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (1 bytes)
+✓ PASS: Single byte / auto
+
+--- Balanced Pipeline ---
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (4.6%, 1.4 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Repeated / balanced
+Compressed: /tmp/tmp.fUMfmfV04X/binary.bin → /tmp/tmp.fUMfmfV04X/test.nex (18.5%, 0.9 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (5120 bytes)
+✓ PASS: Binary / balanced
+
+--- Fast Pipeline ---
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (83.6%, 33.8 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Repeated / fast
+Compressed: /tmp/tmp.fUMfmfV04X/binary.bin → /tmp/tmp.fUMfmfV04X/test.nex (130.9%, 12.0 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (5120 bytes)
+✓ PASS: Binary / fast
+
+--- Max Pipeline ---
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (4.6%, 1.7 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Repeated / max
+Compressed: /tmp/tmp.fUMfmfV04X/binary.bin → /tmp/tmp.fUMfmfV04X/test.nex (18.5%, 0.9 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (5120 bytes)
+✓ PASS: Binary / max
+
+--- Store Pipeline ---
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (100.4%, 459.8 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Repeated / store
+Compressed: /tmp/tmp.fUMfmfV04X/random.bin → /tmp/tmp.fUMfmfV04X/test.nex (100.2%, 736.6 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (32768 bytes)
+✓ PASS: Random / store
+
+--- Compression Levels ---
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (83.6%, 30.2 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Level 1
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (69.0%, 15.5 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Level 5
+Compressed: /tmp/tmp.fUMfmfV04X/repeated.txt → /tmp/tmp.fUMfmfV04X/test.nex (4.6%, 1.0 MB/s)
+Decompressed: /tmp/tmp.fUMfmfV04X/test.nex → /tmp/tmp.fUMfmfV04X/test.out (14001 bytes)
+✓ PASS: Level 9
+
+══════════════════════════════════════════════
+  Results: 16 passed, 0 failed
+══════════════════════════════════════════════

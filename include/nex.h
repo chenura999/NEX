@@ -44,8 +44,9 @@ typedef enum {
     NEX_PIPE_BWT      = 2,  /* BWT + MTF + RLE + rANS (text)   */
     NEX_PIPE_BALANCED = 3,  /* LZ lazy + rANS (general)        */
     NEX_PIPE_FAST     = 4,  /* LZ greedy + Huffman (speed)     */
-    NEX_PIPE_STORE    = 5,  /* Raw copy (incompressible)       */
-    NEX_PIPE_COUNT    = 6,
+    NEX_PIPE_EXEC     = 5,  /* BCJ + LZ optimal + rANS (exec)  */
+    NEX_PIPE_STORE    = 6,  /* Raw copy (incompressible)       */
+    NEX_PIPE_COUNT    = 7,
 } nex_pipeline_id_t;
 
 /* ── Compression Level ───────────────────────────────────────────── */
@@ -68,6 +69,10 @@ typedef struct {
     size_t           chunk_size;  /* default 1MB                 */
     size_t           mem_limit;   /* 0 = auto                    */
     bool             verbose;     /* print diagnostics           */
+    
+    /* V2 Upgrade: Dictionary Pre-training */
+    const uint8_t   *dict_data;   /* Optional pre-trained dict   */
+    size_t           dict_size;   /* Dictionary size             */
 } nex_config_t;
 
 /* ── Compression Statistics ──────────────────────────────────────── */
@@ -99,6 +104,7 @@ nex_status_t nex_compress(const uint8_t *input, size_t input_size,
 /* Decompress in-memory */
 nex_status_t nex_decompress(const uint8_t *input, size_t input_size,
                             nex_buffer_t *output,
+                            const nex_config_t *cfg,
                             nex_stats_t *stats);
 
 /* File-based compress/decompress */
@@ -109,6 +115,7 @@ nex_status_t nex_compress_file(const char *input_path,
 
 nex_status_t nex_decompress_file(const char *input_path,
                                  const char *output_path,
+                                 const nex_config_t *cfg,
                                  nex_stats_t *stats);
 
 /* Error description */

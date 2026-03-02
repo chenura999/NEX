@@ -17,10 +17,10 @@
 
 /* ── Suffix Array via Prefix Doubling + qsort ────────────────────── */
 
-/* Global state for qsort comparator (suffixes only) */
-static int *g_sa_rank = NULL;
-static int  g_sa_k    = 0;
-static int  g_sa_n    = 0;
+/* Thread-local context for qsort comparator */
+static _Thread_local int *g_sa_rank = NULL;
+static _Thread_local int  g_sa_k    = 0;
+static _Thread_local int  g_sa_n    = 0;
 
 static int sa_cmp_fn(const void *a, const void *b) {
     int i = *(const int *)a;
@@ -104,8 +104,8 @@ static void build_suffix_array(const uint8_t *data, size_t n,
 }
 
 nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
-                              nex_buffer_t *out, int level) {
-    (void)level;
+                              nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size == 0) {
         out->size = 0;
         return NEX_OK;
@@ -151,8 +151,8 @@ nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
 /* ── Inverse BWT ─────────────────────────────────────────────────── */
 
 nex_status_t nex_bwt_inverse(const uint8_t *in, size_t in_size,
-                              nex_buffer_t *out, int level) {
-    (void)level;
+                              nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size < 8) return NEX_ERR_CORRUPT;
 
     uint32_t orig_size, primary_idx;
@@ -224,8 +224,8 @@ nex_status_t nex_bwt_inverse(const uint8_t *in, size_t in_size,
  * ═══════════════════════════════════════════════════════════════════ */
 
 nex_status_t nex_mtf_rle_encode(const uint8_t *in, size_t in_size,
-                                 nex_buffer_t *out, int level) {
-    (void)level;
+                                 nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size == 0) {
         out->size = 0;
         return NEX_OK;
@@ -295,8 +295,8 @@ nex_status_t nex_mtf_rle_encode(const uint8_t *in, size_t in_size,
 }
 
 nex_status_t nex_mtf_rle_decode(const uint8_t *in, size_t in_size,
-                                 nex_buffer_t *out, int level) {
-    (void)level;
+                                 nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size < 4) return NEX_ERR_CORRUPT;
 
     uint32_t orig_size;
@@ -353,8 +353,8 @@ nex_status_t nex_mtf_rle_decode(const uint8_t *in, size_t in_size,
  * ═══════════════════════════════════════════════════════════════════ */
 
 nex_status_t nex_delta_encode(const uint8_t *in, size_t in_size,
-                               nex_buffer_t *out, int level) {
-    (void)level;
+                               nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size == 0) {
         out->size = 0;
         return NEX_OK;
@@ -381,8 +381,8 @@ nex_status_t nex_delta_encode(const uint8_t *in, size_t in_size,
 }
 
 nex_status_t nex_delta_decode(const uint8_t *in, size_t in_size,
-                               nex_buffer_t *out, int level) {
-    (void)level;
+                               nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size < 4) return NEX_ERR_CORRUPT;
 
     uint32_t orig_size;
@@ -405,3 +405,85 @@ nex_status_t nex_delta_decode(const uint8_t *in, size_t in_size,
     out->size = orig_size;
     return NEX_OK;
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * BCJ Filter (Branch/Call/Jump)
+ *
+ * Converts x86 relative addresses (e8 / e9) into absolute addresses
+ * to increase redundancy. Completely reversible mapping.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+nex_status_t nex_bcj_x86_encode(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
+    if (in_size == 0) {
+        out->size = 0;
+        return NEX_OK;
+    }
+
+    if (out->capacity < in_size) {
+        uint8_t *new_data = (uint8_t *)realloc(out->data, in_size);
+        if (!new_data) return NEX_ERR_NOMEM;
+        out->data = new_data;
+        out->capacity = in_size;
+    }
+
+    size_t i = 0;
+    while (i < in_size) {
+        if (i + 5 <= in_size && (in[i] == 0xE8 || in[i] == 0xE9)) {
+            uint32_t rel;
+            memcpy(&rel, in + i + 1, 4);
+            /* Skip likely false positives (addresses way entirely out of range) */
+            if (rel < 0x01000000 || rel > 0xFF000000) {
+                uint32_t abs_off = rel + (uint32_t)i;
+                out->data[i] = in[i];
+                memcpy(out->data + i + 1, &abs_off, 4);
+                i += 5;
+                continue;
+            }
+        }
+        out->data[i] = in[i];
+        i++;
+    }
+
+    out->size = in_size;
+    return NEX_OK;
+}
+
+nex_status_t nex_bcj_x86_decode(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
+    if (in_size == 0) {
+        out->size = 0;
+        return NEX_OK;
+    }
+
+    if (out->capacity < in_size) {
+        uint8_t *new_data = (uint8_t *)realloc(out->data, in_size);
+        if (!new_data) return NEX_ERR_NOMEM;
+        out->data = new_data;
+        out->capacity = in_size;
+    }
+
+    size_t i = 0;
+    while (i < in_size) {
+        if (i + 5 <= in_size && (in[i] == 0xE8 || in[i] == 0xE9)) {
+            uint32_t abs_off;
+            memcpy(&abs_off, in + i + 1, 4);
+            /* Test if original relative offset was in bounds (reverse logic) */
+            uint32_t rel = abs_off - (uint32_t)i;
+            if (rel < 0x01000000 || rel > 0xFF000000) {
+                out->data[i] = in[i];
+                memcpy(out->data + i + 1, &rel, 4);
+                i += 5;
+                continue;
+            }
+        }
+        out->data[i] = in[i];
+        i++;
+    }
+
+    out->size = in_size;
+    return NEX_OK;
+}
+

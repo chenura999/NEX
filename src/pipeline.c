@@ -54,6 +54,18 @@ static nex_stage_fn pipe_fast_decompress[] = {
     nex_lz_decompress,
 };
 
+/* ── Pipeline: EXEC (BCJ + LZ optimal + rANS) ─────────────────────── */
+static nex_stage_fn pipe_exec_compress[] = {
+    nex_bcj_x86_encode,
+    nex_lz_compress,
+    nex_rans_compress,
+};
+static nex_stage_fn pipe_exec_decompress[] = {
+    nex_rans_decompress,
+    nex_lz_decompress,
+    nex_bcj_x86_decode,
+};
+
 /* ── Pipeline Registry ───────────────────────────────────────────── */
 
 static nex_pipeline_t pipelines[] = {
@@ -74,6 +86,10 @@ static nex_pipeline_t pipelines[] = {
         NEX_PIPE_FAST, "fast",
         pipe_fast_compress, pipe_fast_decompress, 2
     },
+    [NEX_PIPE_EXEC]     = {
+        NEX_PIPE_EXEC, "exec",
+        pipe_exec_compress, pipe_exec_decompress, 3
+    },
     [NEX_PIPE_STORE]    = {
         NEX_PIPE_STORE, "store", NULL, NULL, 0
     },
@@ -88,7 +104,7 @@ const nex_pipeline_t *nex_get_pipeline(nex_pipeline_id_t id) {
 
 nex_status_t nex_pipeline_compress(nex_pipeline_id_t id,
                                     const uint8_t *in, size_t in_size,
-                                    nex_buffer_t *out, int level) {
+                                    nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
     /* Store pipeline: just copy */
     if (id == NEX_PIPE_STORE) {
         if (out->capacity < in_size) {
@@ -127,7 +143,7 @@ nex_status_t nex_pipeline_compress(nex_pipeline_id_t id,
         if (id == NEX_PIPE_FAST) stage_level = NEX_MIN(level, 2);
         else if (id == NEX_PIPE_MAX) stage_level = NEX_MAX(level, 7);
 
-        st = pipe->compress_stages[i](cur_in, cur_size, cur_out, stage_level);
+        st = pipe->compress_stages[i](cur_in, cur_size, cur_out, stage_level, dict, dict_size);
         if (st != NEX_OK) {
             nex_buffer_free(&buf_a);
             nex_buffer_free(&buf_b);
@@ -159,7 +175,7 @@ nex_status_t nex_pipeline_compress(nex_pipeline_id_t id,
 
 nex_status_t nex_pipeline_decompress(nex_pipeline_id_t id,
                                       const uint8_t *in, size_t in_size,
-                                      nex_buffer_t *out, int level) {
+                                      nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
     /* Store pipeline: just copy */
     if (id == NEX_PIPE_STORE) {
         if (out->capacity < in_size) {
@@ -193,7 +209,7 @@ nex_status_t nex_pipeline_decompress(nex_pipeline_id_t id,
             return st;
         }
 
-        st = pipe->decompress_stages[i](cur_in, cur_size, cur_out, level);
+        st = pipe->decompress_stages[i](cur_in, cur_size, cur_out, level, dict, dict_size);
         if (st != NEX_OK) {
             nex_buffer_free(&buf_a);
             nex_buffer_free(&buf_b);

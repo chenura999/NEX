@@ -158,8 +158,8 @@ static inline uint8_t rans_lookup_symbol(const rans_freq_table_t *ft,
 /* ── rANS Compress ───────────────────────────────────────────────── */
 
 nex_status_t nex_rans_compress(const uint8_t *in, size_t in_size,
-                                nex_buffer_t *out, int level) {
-    (void)level;
+                                nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size == 0) {
         out->size = 0;
         return NEX_OK;
@@ -169,8 +169,10 @@ nex_status_t nex_rans_compress(const uint8_t *in, size_t in_size,
     rans_freq_table_t ft;
     rans_build_freq_table(in, in_size, &ft);
 
-    /* Allocate working buffer (worst case: input size + overhead) */
-    size_t work_size = in_size + 4096;
+    /* Allocate working buffer (worst case: input size + large overhead for expansion)
+       In worst-case (entropy > 8.0 equivalents), data can expand by up to ~15%.
+       We allocate enough headroom for backwards encoding. */
+    size_t work_size = in_size + (in_size / 4) + 8192;
     uint8_t *work = (uint8_t *)malloc(work_size);
     if (!work) return NEX_ERR_NOMEM;
 
@@ -233,8 +235,8 @@ nex_status_t nex_rans_compress(const uint8_t *in, size_t in_size,
 /* ── rANS Decompress ─────────────────────────────────────────────── */
 
 nex_status_t nex_rans_decompress(const uint8_t *in, size_t in_size,
-                                  nex_buffer_t *out, int level) {
-    (void)level;
+                                  nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size < 520) return NEX_ERR_CORRUPT; /* 4+4+512 minimum header */
 
     const uint8_t *ip = in;
@@ -268,16 +270,45 @@ nex_status_t nex_rans_decompress(const uint8_t *in, size_t in_size,
         out->capacity = orig_size;
     }
 
+    /* Build Table-Driven rANS decoding lookup (O(1) decode) */
+    typedef struct {
+        uint16_t freq;
+        uint16_t start;
+        uint8_t  sym;
+    } rans_dec_table_t;
+
+    rans_dec_table_t dec_table[NEX_FREQ_SUM];
+    for (int sym = 0; sym < 256; sym++) {
+        if (ft.freq[sym] == 0) continue;
+        for (int j = 0; j < ft.freq[sym]; j++) {
+            int cum = ft.cum_freq[sym] + j;
+            dec_table[cum].sym = (uint8_t)sym;
+            dec_table[cum].freq = ft.freq[sym];
+            dec_table[cum].start = ft.cum_freq[sym];
+        }
+    }
+
     /* Decode */
     const uint8_t *dec_ptr = ip;
     rans_state_t state;
     rans_dec_init(&state, &dec_ptr);
 
+    uint8_t *op = out->data;
+    uint32_t mask = NEX_FREQ_SUM - 1;
+
     for (uint32_t i = 0; i < orig_size; i++) {
-        uint32_t cum = rans_dec_get(state);
-        uint8_t sym = rans_lookup_symbol(&ft, cum);
-        out->data[i] = sym;
-        rans_dec_advance(&state, &dec_ptr, ft.cum_freq[sym], ft.freq[sym]);
+        uint32_t cum = state & mask;
+        rans_dec_table_t t = dec_table[cum];
+        
+        *op++ = t.sym;
+        
+        /* O(1) State Advance */
+        state = t.freq * (state >> NEX_FREQ_BITS) + cum - t.start;
+
+        /* Renormalize */
+        while (state < RANS_L) {
+            state = (state << 8) | *dec_ptr++;
+        }
     }
 
     out->size = orig_size;
@@ -406,8 +437,8 @@ static void huff_build_codes(const uint8_t *lengths, huff_code_t *codes) {
 /* ── Huffman Compress ────────────────────────────────────────────── */
 
 nex_status_t nex_huffman_compress(const uint8_t *in, size_t in_size,
-                                   nex_buffer_t *out, int level) {
-    (void)level;
+                                   nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size == 0) {
         out->size = 0;
         return NEX_OK;
@@ -475,8 +506,8 @@ nex_status_t nex_huffman_compress(const uint8_t *in, size_t in_size,
 /* ── Huffman Decompress ──────────────────────────────────────────── */
 
 nex_status_t nex_huffman_decompress(const uint8_t *in, size_t in_size,
-                                     nex_buffer_t *out, int level) {
-    (void)level;
+                                     nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
     if (in_size < 264) return NEX_ERR_CORRUPT;
 
     const uint8_t *ip = in;

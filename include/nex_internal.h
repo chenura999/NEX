@@ -25,10 +25,11 @@
 #define NEX_MAGIC         0x0158454EU  /* "NEX\x01" LE              */
 #define NEX_FOOTER_MAGIC  0x0158454EU  /* "XEN\x01" LE (reversed)   */
 #define NEX_FORMAT_VER    1
+#define NEX_FLAG_MICRO    0x0001       /* Sub-1KB micro header flag */
 
 #define NEX_DEFAULT_CHUNK_SIZE  (1 << 20)   /* 1 MB                 */
 #define NEX_MIN_CHUNK_SIZE      (1 << 12)   /* 4 KB                 */
-#define NEX_MAX_CHUNK_SIZE      (1 << 24)   /* 16 MB                */
+#define NEX_MAX_CHUNK_SIZE      (1 << 27)   /* 128 MB               */
 
 #define NEX_LZ_MIN_MATCH       3
 #define NEX_LZ_MAX_MATCH       258
@@ -121,7 +122,8 @@ typedef struct {
 
 /* ── Pipeline Stage Function Types ───────────────────────────────── */
 typedef nex_status_t (*nex_stage_fn)(const uint8_t *in, size_t in_size,
-                                     nex_buffer_t *out, int level);
+                                     nex_buffer_t *out, int level,
+                                     const uint8_t *dict, size_t dict_size);
 
 typedef struct {
     nex_pipeline_id_t id;
@@ -148,42 +150,62 @@ nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level);
 
 /* lz_match.c */
 nex_status_t nex_lz_compress(const uint8_t *in, size_t in_size,
-                              nex_buffer_t *out, int level);
+                              nex_buffer_t *out, int level,
+                              const uint8_t *dict, size_t dict_size);
 nex_status_t nex_lz_decompress(const uint8_t *in, size_t in_size,
-                                nex_buffer_t *out, int level);
+                                nex_buffer_t *out, int level,
+                                const uint8_t *dict, size_t dict_size);
 
 /* transform.c */
 nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
-                              nex_buffer_t *out, int level);
+                              nex_buffer_t *out, int level,
+                              const uint8_t *dict, size_t dict_size);
 nex_status_t nex_bwt_inverse(const uint8_t *in, size_t in_size,
-                              nex_buffer_t *out, int level);
+                              nex_buffer_t *out, int level,
+                              const uint8_t *dict, size_t dict_size);
 nex_status_t nex_delta_encode(const uint8_t *in, size_t in_size,
-                               nex_buffer_t *out, int level);
+                               nex_buffer_t *out, int level,
+                               const uint8_t *dict, size_t dict_size);
 nex_status_t nex_delta_decode(const uint8_t *in, size_t in_size,
-                               nex_buffer_t *out, int level);
+                               nex_buffer_t *out, int level,
+                               const uint8_t *dict, size_t dict_size);
 nex_status_t nex_mtf_rle_encode(const uint8_t *in, size_t in_size,
-                                 nex_buffer_t *out, int level);
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size);
 nex_status_t nex_mtf_rle_decode(const uint8_t *in, size_t in_size,
-                                 nex_buffer_t *out, int level);
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size);
+nex_status_t nex_bcj_x86_encode(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size);
+nex_status_t nex_bcj_x86_decode(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size);
 
 /* entropy.c */
 nex_status_t nex_rans_compress(const uint8_t *in, size_t in_size,
-                                nex_buffer_t *out, int level);
+                                nex_buffer_t *out, int level,
+                                const uint8_t *dict, size_t dict_size);
 nex_status_t nex_rans_decompress(const uint8_t *in, size_t in_size,
-                                  nex_buffer_t *out, int level);
+                                  nex_buffer_t *out, int level,
+                                  const uint8_t *dict, size_t dict_size);
 nex_status_t nex_huffman_compress(const uint8_t *in, size_t in_size,
-                                   nex_buffer_t *out, int level);
+                                   nex_buffer_t *out, int level,
+                                   const uint8_t *dict, size_t dict_size);
 nex_status_t nex_huffman_decompress(const uint8_t *in, size_t in_size,
-                                     nex_buffer_t *out, int level);
+                                     nex_buffer_t *out, int level,
+                                     const uint8_t *dict, size_t dict_size);
 
 /* pipeline.c */
 const nex_pipeline_t *nex_get_pipeline(nex_pipeline_id_t id);
 nex_status_t nex_pipeline_compress(nex_pipeline_id_t id,
                                     const uint8_t *in, size_t in_size,
-                                    nex_buffer_t *out, int level);
+                                    nex_buffer_t *out, int level,
+                                    const uint8_t *dict, size_t dict_size);
 nex_status_t nex_pipeline_decompress(nex_pipeline_id_t id,
                                       const uint8_t *in, size_t in_size,
-                                      nex_buffer_t *out, int level);
+                                      nex_buffer_t *out, int level,
+                                      const uint8_t *dict, size_t dict_size);
 
 /* container.c */
 nex_status_t nex_write_header(nex_buffer_t *out, const nex_header_t *hdr);

@@ -150,6 +150,11 @@ nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level) {
         return NEX_PIPE_STORE;
     }
 
+    /* V2 Upgrade: Auto-select BCJ EXEC pipeline for executables */
+    if (profile->type == NEX_DATA_EXEC) {
+        return (level <= 2) ? NEX_PIPE_FAST : NEX_PIPE_EXEC;
+    }
+
     /* Fast mode override */
     if (level <= 2) {
         return NEX_PIPE_FAST;
@@ -160,9 +165,6 @@ nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level) {
         return NEX_PIPE_MAX;
     }
 
-    /* Default → balanced LZ pipeline (works well on all data types)
-     * Note: BWT pipeline is available via explicit -p bwt flag
-     * and excels on small-to-medium text, but auto-select uses
-     * BALANCED for reliability and consistent speed. */
+    /* Default → balanced LZ pipeline */
     return NEX_PIPE_BALANCED;
 }

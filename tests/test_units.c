@@ -96,10 +96,10 @@ static void test_lz(void) {
     nex_buffer_t compressed = {0}, decompressed = {0};
     nex_status_t st;
 
-    st = nex_lz_compress((const uint8_t *)pattern, len, &compressed, 6);
+    st = nex_lz_compress((const uint8_t *)pattern, len, &compressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "LZ compress ok");
 
-    st = nex_lz_decompress(compressed.data, compressed.size, &decompressed, 6);
+    st = nex_lz_decompress(compressed.data, compressed.size, &decompressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "LZ decompress ok");
     ASSERT(decompressed.size == len, "LZ size matches");
     ASSERT(memcmp(decompressed.data, pattern, len) == 0, "LZ data matches");
@@ -114,10 +114,10 @@ static void test_lz(void) {
     memset(&compressed, 0, sizeof(compressed));
     memset(&decompressed, 0, sizeof(decompressed));
 
-    st = nex_lz_compress(large, 4096, &compressed, 6);
+    st = nex_lz_compress(large, 4096, &compressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "LZ compress 4KB ok");
 
-    st = nex_lz_decompress(compressed.data, compressed.size, &decompressed, 6);
+    st = nex_lz_decompress(compressed.data, compressed.size, &decompressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "LZ decompress 4KB ok");
     ASSERT(decompressed.size == 4096, "LZ 4KB size matches");
     ASSERT(memcmp(decompressed.data, large, 4096) == 0, "LZ 4KB data matches");
@@ -136,10 +136,10 @@ static void test_bwt(void) {
     nex_buffer_t transformed = {0}, restored = {0};
     nex_status_t st;
 
-    st = nex_bwt_forward((const uint8_t *)text, len, &transformed, 6);
+    st = nex_bwt_forward((const uint8_t *)text, len, &transformed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "BWT forward ok");
 
-    st = nex_bwt_inverse(transformed.data, transformed.size, &restored, 6);
+    st = nex_bwt_inverse(transformed.data, transformed.size, &restored, 6, NULL, 0);
     ASSERT(st == NEX_OK, "BWT inverse ok");
     ASSERT(restored.size == len, "BWT size matches");
     ASSERT(memcmp(restored.data, text, len) == 0, "BWT round-trip matches");
@@ -154,10 +154,10 @@ static void test_bwt(void) {
     memset(&transformed, 0, sizeof(transformed));
     memset(&restored, 0, sizeof(restored));
 
-    st = nex_bwt_forward((const uint8_t *)longer, len, &transformed, 6);
+    st = nex_bwt_forward((const uint8_t *)longer, len, &transformed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "BWT forward longer ok");
 
-    st = nex_bwt_inverse(transformed.data, transformed.size, &restored, 6);
+    st = nex_bwt_inverse(transformed.data, transformed.size, &restored, 6, NULL, 0);
     ASSERT(st == NEX_OK, "BWT inverse longer ok");
     ASSERT(restored.size == len, "BWT longer size matches");
     ASSERT(memcmp(restored.data, longer, len) == 0, "BWT longer round-trip");
@@ -175,10 +175,10 @@ static void test_delta(void) {
 
     nex_buffer_t encoded = {0}, decoded = {0};
 
-    nex_status_t st = nex_delta_encode(data, len, &encoded, 6);
+    nex_status_t st = nex_delta_encode(data, len, &encoded, 6, NULL, 0);
     ASSERT(st == NEX_OK, "Delta encode ok");
 
-    st = nex_delta_decode(encoded.data, encoded.size, &decoded, 6);
+    st = nex_delta_decode(encoded.data, encoded.size, &decoded, 6, NULL, 0);
     ASSERT(st == NEX_OK, "Delta decode ok");
     ASSERT(decoded.size == len, "Delta size matches");
     ASSERT(memcmp(decoded.data, data, len) == 0, "Delta round-trip matches");
@@ -198,11 +198,11 @@ static void test_rans(void) {
     nex_buffer_t compressed = {0}, decompressed = {0};
 
     nex_status_t st = nex_rans_compress((const uint8_t *)text, len,
-                                         &compressed, 6);
+                                         &compressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "rANS compress ok");
 
     st = nex_rans_decompress(compressed.data, compressed.size,
-                              &decompressed, 6);
+                              &decompressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "rANS decompress ok");
     ASSERT(decompressed.size == len, "rANS size matches");
     ASSERT(memcmp(decompressed.data, text, len) == 0, "rANS round-trip");
@@ -217,11 +217,11 @@ static void test_rans(void) {
     memset(&compressed, 0, sizeof(compressed));
     memset(&decompressed, 0, sizeof(decompressed));
 
-    st = nex_rans_compress(data, 2048, &compressed, 6);
+    st = nex_rans_compress(data, 2048, &compressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "rANS compress 2KB ok");
 
     st = nex_rans_decompress(compressed.data, compressed.size,
-                              &decompressed, 6);
+                              &decompressed, 6, NULL, 0);
     ASSERT(st == NEX_OK, "rANS decompress 2KB ok");
     ASSERT(decompressed.size == 2048, "rANS 2KB size matches");
     ASSERT(memcmp(decompressed.data, data, 2048) == 0, "rANS 2KB round-trip");
@@ -306,13 +306,13 @@ static void test_pipelines(void) {
         nex_buffer_t comp = {0}, decomp = {0};
 
         nex_status_t st = nex_pipeline_compress(pipes[p], data, len,
-                                                 &comp, 6);
+                                                 &comp, 6, NULL, 0);
         char msg[128];
         snprintf(msg, sizeof(msg), "Pipeline %s compress ok", names[p]);
         ASSERT(st == NEX_OK, msg);
 
         st = nex_pipeline_decompress(pipes[p], comp.data, comp.size,
-                                      &decomp, 6);
+                                      &decomp, 6, NULL, 0);
         snprintf(msg, sizeof(msg), "Pipeline %s decompress ok", names[p]);
         ASSERT(st == NEX_OK, msg);
 
@@ -355,7 +355,7 @@ static void test_full_api(void) {
     nex_buffer_t decomp = {0};
     nex_stats_t dstats = {0};
 
-    st = nex_decompress(comp.data, comp.size, &decomp, &dstats);
+    st = nex_decompress(comp.data, comp.size, &decomp, &cfg, &dstats);
     ASSERT(st == NEX_OK, "Full decompress ok");
     ASSERT(decomp.size == len, "Decompressed size matches");
     ASSERT(memcmp(decomp.data, data, len) == 0, "Decompressed data matches");

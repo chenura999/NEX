@@ -1,7 +1,9 @@
 # NEX Compress — Build System
 CC       = gcc
-CFLAGS   = -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE
-LDFLAGS  = -lpthread -lm
+CFLAGS   = -O3 -march=native -Wall -Wextra -std=c11 -Iinclude -D_GNU_SOURCE \
+           -fstack-protector-strong -D_FORTIFY_SOURCE=3 -fPIE -fPIC \
+           -Wformat -Wformat-security -Werror=format-security
+LDFLAGS  = -lpthread -lm -pie -Wl,-z,relro,-z,now
 SRCDIR   = src
 OBJDIR   = build
 SOURCES  = $(wildcard $(SRCDIR)/*.c)
