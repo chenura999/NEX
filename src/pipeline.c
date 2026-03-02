@@ -44,14 +44,12 @@ static nex_stage_fn pipe_balanced_decompress[] = {
     nex_lz_decompress,
 };
 
-/* ── Pipeline: FAST (LZ greedy → Huffman) ─────────────────────────── */
+/* ── Pipeline: FAST (LZ4-style single-pass — no entropy stage) ───── */
 static nex_stage_fn pipe_fast_compress[] = {
-    nex_lz_compress,
-    nex_huffman_compress,
+    nex_lz_fast_compress,
 };
 static nex_stage_fn pipe_fast_decompress[] = {
-    nex_huffman_decompress,
-    nex_lz_decompress,
+    nex_lz_fast_decompress,
 };
 
 /* ── Pipeline: EXEC (BCJ + LZ optimal + rANS) ─────────────────────── */
@@ -84,7 +82,7 @@ static nex_pipeline_t pipelines[] = {
     },
     [NEX_PIPE_FAST]     = {
         NEX_PIPE_FAST, "fast",
-        pipe_fast_compress, pipe_fast_decompress, 2
+        pipe_fast_compress, pipe_fast_decompress, 1
     },
     [NEX_PIPE_EXEC]     = {
         NEX_PIPE_EXEC, "exec",

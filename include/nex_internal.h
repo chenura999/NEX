@@ -156,6 +156,14 @@ nex_status_t nex_lz_decompress(const uint8_t *in, size_t in_size,
                                 nex_buffer_t *out, int level,
                                 const uint8_t *dict, size_t dict_size);
 
+/* lz_fast.c */
+nex_status_t nex_lz_fast_compress(const uint8_t *in, size_t in_size,
+                                   nex_buffer_t *out, int level,
+                                   const uint8_t *dict, size_t dict_size);
+nex_status_t nex_lz_fast_decompress(const uint8_t *in, size_t in_size,
+                                     nex_buffer_t *out, int level,
+                                     const uint8_t *dict, size_t dict_size);
+
 /* transform.c */
 nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
                               nex_buffer_t *out, int level,
@@ -195,6 +203,12 @@ nex_status_t nex_huffman_compress(const uint8_t *in, size_t in_size,
 nex_status_t nex_huffman_decompress(const uint8_t *in, size_t in_size,
                                      nex_buffer_t *out, int level,
                                      const uint8_t *dict, size_t dict_size);
+nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
+                               nex_buffer_t *out, int level,
+                               const uint8_t *dict, size_t dict_size);
+nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size);
 
 /* pipeline.c */
 const nex_pipeline_t *nex_get_pipeline(nex_pipeline_id_t id);
