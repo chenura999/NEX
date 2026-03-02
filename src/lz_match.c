@@ -22,9 +22,14 @@
 
 /* ── Rolling Hash ────────────────────────────────────────────────── */
 
-static inline uint32_t lz_hash4(const uint8_t *p) {
-    uint32_t v;
-    memcpy(&v, p, 4);
+static inline uint32_t lz_hash4(const uint8_t *p, size_t remaining) {
+    uint32_t v = 0;
+    if (NEX_LIKELY(remaining >= 4)) {
+        memcpy(&v, p, 4);
+    } else {
+        /* Safe read for end of buffer */
+        if (remaining > 0) memcpy(&v, p, remaining);
+    }
     return (v * 0x9E3779B1U) >> (32 - NEX_LZ_HASH_BITS);
 }
 
@@ -83,8 +88,8 @@ static void lz_find_match(lz_match_finder_t *mf, size_t pos,
     *best_offset = 0;
 
     if (pos + mf->min_match > mf->window_size) return;
-
-    uint32_t h = lz_hash4(mf->window + pos);
+    size_t remaining = mf->window_size - pos;
+    uint32_t h = lz_hash4(mf->window + pos, remaining);
     uint32_t cur = mf->hash_table[h];
     int chain_count = 0;
 
@@ -101,7 +106,8 @@ static void lz_find_match(lz_match_finder_t *mf, size_t pos,
 
         /* Quick check: compare first and last bytes of current best */
         if (*best_len >= (uint32_t)mf->min_match) {
-            if (ref[*best_len] != src[*best_len] || ref[0] != src[0]) {
+            /* Ensure the index is safe: best_len must be < max_len */
+            if (*best_len >= max_len || ref[*best_len] != src[*best_len] || ref[0] != src[0]) {
                 cur = mf->chain[cur];
                 chain_count++;
                 continue;
@@ -124,8 +130,9 @@ static void lz_find_match(lz_match_finder_t *mf, size_t pos,
 }
 
 static void lz_update_hash(lz_match_finder_t *mf, size_t pos) {
-    if (pos + 4 > mf->window_size) return;
-    uint32_t h = lz_hash4(mf->window + pos);
+    if (pos + mf->min_match > mf->window_size) return;
+    size_t remaining = mf->window_size - pos;
+    uint32_t h = lz_hash4(mf->window + pos, remaining);
     mf->chain[pos] = mf->hash_table[h];
     mf->hash_table[h] = (uint32_t)pos;
 }
