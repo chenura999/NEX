@@ -12,13 +12,13 @@
  * are executed in order; decompress stages are executed in reverse.
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Pipeline: MAX (LZ optimal → rANS) ──────────────────────────── */
+/* ── Pipeline: MAX (LZ optimal → cascaded entropy) ──────────────── */
 static nex_stage_fn pipe_max_compress[] = {
     nex_lz_compress,
-    nex_rans_compress,
+    nex_cascaded_compress,
 };
 static nex_stage_fn pipe_max_decompress[] = {
-    nex_rans_decompress,
+    nex_cascaded_decompress,
     nex_lz_decompress,
 };
 
@@ -34,13 +34,13 @@ static nex_stage_fn pipe_bwt_decompress[] = {
     nex_bwt_inverse,
 };
 
-/* ── Pipeline: BALANCED (LZ lazy → rANS) ─────────────────────────── */
+/* ── Pipeline: BALANCED (LZ lazy → cascaded entropy) ─────────────── */
 static nex_stage_fn pipe_balanced_compress[] = {
     nex_lz_compress,
-    nex_rans_compress,
+    nex_cascaded_compress,
 };
 static nex_stage_fn pipe_balanced_decompress[] = {
-    nex_rans_decompress,
+    nex_cascaded_decompress,
     nex_lz_decompress,
 };
 

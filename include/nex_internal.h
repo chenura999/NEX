@@ -209,6 +209,12 @@ nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
 nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
                                  nex_buffer_t *out, int level,
                                  const uint8_t *dict, size_t dict_size);
+nex_status_t nex_cascaded_compress(const uint8_t *in, size_t in_size,
+                                    nex_buffer_t *out, int level,
+                                    const uint8_t *dict, size_t dict_size);
+nex_status_t nex_cascaded_decompress(const uint8_t *in, size_t in_size,
+                                      nex_buffer_t *out, int level,
+                                      const uint8_t *dict, size_t dict_size);
 
 /* pipeline.c */
 const nex_pipeline_t *nex_get_pipeline(nex_pipeline_id_t id);

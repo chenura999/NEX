@@ -965,4 +965,478 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
     return NEX_OK;
 }
 
+/* ═══════════════════════════════════════════════════════════════════
+ * Innovation #2: Multi-Table Cascaded Entropy (NEX original)
+ *
+ * Instead of entropy-coding the entire LZ token stream as one block,
+ * we split it into 3 sub-streams with different statistical profiles:
+ *   1. Literals (text-like distribution, 256 symbols)
+ *   2. Match lengths (power-law, mostly short matches)
+ *   3. Match offsets (heavy on recent offsets)
+ *
+ * Each sub-stream gets its own FSE table, dramatically improving
+ * compression because each table is tuned for its data type.
+ *
+ * Additionally, a repeat-offset cache (last 3 offsets) reduces
+ * offset entropy by encoding recent offsets as special codes 1/2/3.
+ *
+ * Format:
+ *   [4 bytes]  total original size (of LZ token stream)
+ *   [4 bytes]  total compressed size
+ *   [1 byte]   0xCE format marker (Cascaded Entropy)
+ *   [4 bytes]  literal_count
+ *   [4 bytes]  match_count
+ *   [4 bytes]  flag_bytes (packed is_match bitstream length)
+ *   [4 bytes]  lit_comp_size
+ *   [4 bytes]  len_comp_size
+ *   [4 bytes]  off_comp_size
+ *   [flag_bytes]  packed is_match/is_literal flags
+ *   [lit_comp_size]  FSE-compressed literal sub-stream
+ *   [len_comp_size]  FSE-compressed length sub-stream
+ *   [off_comp_size]  FSE-compressed offset sub-stream
+ * ═══════════════════════════════════════════════════════════════════ */
 
+/* Repeat-offset cache: encode common offsets as small codes.
+ * Offset values 1, 2, 3 = repeat offset #1, #2, #3.
+ * All other offsets are stored as (offset + 3) to avoid collision. */
+#define REP_OFFSET_COUNT 3
+
+static void rep_offset_init(uint32_t *rep) {
+    rep[0] = 1; rep[1] = 4; rep[2] = 8;
+}
+
+static uint32_t rep_offset_encode(uint32_t *rep, uint32_t offset) {
+    /* Check if offset matches one of the recent offsets */
+    for (int i = 0; i < REP_OFFSET_COUNT; i++) {
+        if (offset == rep[i]) {
+            /* Promote this offset to position 0, shift others */
+            uint32_t matched = rep[i];
+            for (int j = i; j > 0; j--) rep[j] = rep[j-1];
+            rep[0] = matched;
+            return (uint32_t)(i + 1);  /* code 1, 2, or 3 */
+        }
+    }
+    /* New offset — shift cache and insert */
+    rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = offset;
+    return offset + REP_OFFSET_COUNT;  /* shifted to avoid collision */
+}
+
+static uint32_t rep_offset_decode(uint32_t *rep, uint32_t code) {
+    if (code >= 1 && code <= REP_OFFSET_COUNT) {
+        int idx = (int)(code - 1);
+        uint32_t offset = rep[idx];
+        for (int j = idx; j > 0; j--) rep[j] = rep[j-1];
+        rep[0] = offset;
+        return offset;
+    }
+    uint32_t offset = code - REP_OFFSET_COUNT;
+    rep[2] = rep[1]; rep[1] = rep[0]; rep[0] = offset;
+    return offset;
+}
+
+/* Compress a raw byte sub-stream using FSE, with rANS fallback.
+ * Returns compressed block in `out`. */
+static nex_status_t cascade_compress_substream(const uint8_t *data, size_t size,
+                                                 nex_buffer_t *out, int level) {
+    if (size == 0) {
+        out->size = 0;
+        return NEX_OK;
+    }
+
+    /* Try FSE first, fall back to rANS */
+    nex_status_t st = nex_fse_compress(data, size, out, level, NULL, 0);
+    if (st != NEX_OK || out->size >= size) {
+        st = nex_rans_compress(data, size, out, level, NULL, 0);
+    }
+    return st;
+}
+
+/* Decompress a sub-stream (auto-detects FSE vs rANS from format marker) */
+static nex_status_t cascade_decompress_substream(const uint8_t *data, size_t size,
+                                                    nex_buffer_t *out) {
+    if (size == 0) {
+        out->size = 0;
+        return NEX_OK;
+    }
+    /* nex_fse_decompress auto-detects 0xFE marker and falls back to rANS */
+    return nex_fse_decompress(data, size, out, 0, NULL, 0);
+}
+
+nex_status_t nex_cascaded_compress(const uint8_t *in, size_t in_size,
+                                    nex_buffer_t *out, int level,
+                                    const uint8_t *dict, size_t dict_size) {
+    (void)dict; (void)dict_size;
+
+    if (in_size < 16) {
+        /* Too small for cascaded — use plain rANS */
+        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+    }
+
+    /* ── Step 1: Parse the LZ token stream ─────────────────────────── */
+    const uint8_t *p = in;
+    const uint8_t *const end = in + in_size;
+
+    if (p + 8 > end) return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+
+    uint32_t original_size; memcpy(&original_size, p, 4); p += 4;
+    uint32_t token_count;   memcpy(&token_count, p, 4);   p += 4;
+
+    /* Pre-allocate sub-stream buffers (generous estimates) */
+    size_t max_lits = original_size;
+    size_t max_matches = token_count;
+
+    uint8_t *literals = (uint8_t *)malloc(max_lits);
+    uint8_t *lengths_buf = (uint8_t *)malloc(max_matches * 2);
+    uint8_t *offsets_buf = (uint8_t *)malloc(max_matches * 4);
+    /* Flag bitstream: 1 bit per "output byte" to indicate literal vs match-start */
+    size_t flag_cap = (original_size + 7) / 8 + 16;
+    uint8_t *flags = (uint8_t *)calloc(flag_cap, 1);
+
+    if (!literals || !lengths_buf || !offsets_buf || !flags) {
+        free(literals); free(lengths_buf); free(offsets_buf); free(flags);
+        return NEX_ERR_NOMEM;
+    }
+
+    size_t lit_count = 0, match_count = 0;
+    size_t len_buf_pos = 0, off_buf_pos = 0;
+    uint32_t out_pos = 0;  /* tracks output position for flag bits */
+
+    uint32_t rep[REP_OFFSET_COUNT];
+    rep_offset_init(rep);
+
+    /* Walk through the serialized LZ tokens */
+    while (p < end) {
+        uint8_t first = *p++;
+        if (first == 0x00) {
+            /* Literal run: 0x00 [count:2] [bytes...] */
+            if (p + 2 > end) break;
+            uint16_t run_len; memcpy(&run_len, p, 2); p += 2;
+            if (p + run_len > end) break;
+
+            for (uint16_t i = 0; i < run_len; i++) {
+                if (lit_count < max_lits) {
+                    literals[lit_count++] = *p++;
+                } else { p++; }
+                /* Flag bit 0 = literal */
+                if (out_pos < original_size) out_pos++;
+            }
+        } else {
+            /* Match: flags|0x01 [length:1-2] [offset:1-4] */
+            uint8_t fflags = first;
+            uint8_t offset_enc = (fflags >> 1) & 3;
+            uint8_t length_enc = (fflags >> 3) & 1;
+
+            uint16_t mlen;
+            if (length_enc == 0) {
+                if (p >= end) break;
+                mlen = *p++;
+            } else {
+                if (p + 2 > end) break;
+                memcpy(&mlen, p, 2); p += 2;
+            }
+
+            uint32_t moff;
+            if (offset_enc == 0) {
+                if (p >= end) break;
+                moff = *p++;
+            } else if (offset_enc == 1) {
+                if (p + 2 > end) break;
+                uint16_t off16; memcpy(&off16, p, 2); p += 2;
+                moff = off16;
+            } else {
+                if (p + 4 > end) break;
+                memcpy(&moff, p, 4); p += 4;
+            }
+
+            /* Apply repeat-offset encoding */
+            uint32_t coded_offset = rep_offset_encode(rep, moff);
+
+            /* Store length as 2 bytes (little-endian) */
+            if (len_buf_pos + 2 <= max_matches * 2) {
+                uint16_t len16 = mlen;
+                memcpy(lengths_buf + len_buf_pos, &len16, 2);
+                len_buf_pos += 2;
+            }
+
+            /* Store coded offset as 4 bytes (little-endian) */
+            if (off_buf_pos + 4 <= max_matches * 4) {
+                memcpy(offsets_buf + off_buf_pos, &coded_offset, 4);
+                off_buf_pos += 4;
+            }
+
+            /* Set flag bit 1 = match start, rest of match bytes = 0 */
+            if (out_pos < original_size) {
+                flags[out_pos / 8] |= (1U << (out_pos % 8));
+                out_pos++;
+            }
+            /* Skip flag bits for the rest of the match */
+            for (uint16_t i = 1; i < mlen && out_pos < original_size; i++) {
+                out_pos++;
+            }
+            match_count++;
+        }
+    }
+
+    size_t flag_bytes = (out_pos + 7) / 8;
+
+    /* ── Step 2: FSE-compress each sub-stream independently ────────── */
+    nex_buffer_t lit_comp = {0}, len_comp = {0}, off_comp = {0};
+
+    nex_status_t st;
+    st = cascade_compress_substream(literals, lit_count, &lit_comp, level);
+    if (st != NEX_OK) goto fail;
+
+    st = cascade_compress_substream(lengths_buf, len_buf_pos, &len_comp, level);
+    if (st != NEX_OK) goto fail;
+
+    st = cascade_compress_substream(offsets_buf, off_buf_pos, &off_comp, level);
+    if (st != NEX_OK) goto fail;
+
+    /* ── Step 3: Pack everything together ──────────────────────────── */
+    size_t total = 8 + 1 + 4*6 + flag_bytes + lit_comp.size + len_comp.size + off_comp.size;
+
+    /* Check if cascaded actually helps vs plain rANS */
+    if (total >= in_size) {
+        /* Not worth it — fall back to rANS on the whole LZ stream */
+        free(literals); free(lengths_buf); free(offsets_buf); free(flags);
+        nex_buffer_free(&lit_comp); nex_buffer_free(&len_comp); nex_buffer_free(&off_comp);
+        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+    }
+
+    if (out->capacity < total) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, total);
+        if (!nd) { st = NEX_ERR_NOMEM; goto fail; }
+        out->data = nd; out->capacity = total;
+    }
+
+    uint8_t *wp = out->data;
+    uint32_t orig32 = (uint32_t)in_size;
+    memcpy(wp, &orig32, 4); wp += 4;
+    uint8_t *csz_ptr = wp; wp += 4;
+
+    *wp++ = 0xCE;  /* Cascaded Entropy marker */
+
+    uint32_t v;
+    v = (uint32_t)lit_count;   memcpy(wp, &v, 4); wp += 4;
+    v = (uint32_t)match_count; memcpy(wp, &v, 4); wp += 4;
+    v = (uint32_t)flag_bytes;  memcpy(wp, &v, 4); wp += 4;
+    v = (uint32_t)lit_comp.size;  memcpy(wp, &v, 4); wp += 4;
+    v = (uint32_t)len_comp.size;  memcpy(wp, &v, 4); wp += 4;
+    v = (uint32_t)off_comp.size;  memcpy(wp, &v, 4); wp += 4;
+
+    memcpy(wp, flags, flag_bytes); wp += flag_bytes;
+    memcpy(wp, lit_comp.data, lit_comp.size); wp += lit_comp.size;
+    memcpy(wp, len_comp.data, len_comp.size); wp += len_comp.size;
+    memcpy(wp, off_comp.data, off_comp.size); wp += off_comp.size;
+
+    uint32_t cds = (uint32_t)(wp - out->data - 8);
+    memcpy(csz_ptr, &cds, 4);
+    out->size = (size_t)(wp - out->data);
+
+    free(literals); free(lengths_buf); free(offsets_buf); free(flags);
+    nex_buffer_free(&lit_comp); nex_buffer_free(&len_comp); nex_buffer_free(&off_comp);
+    return NEX_OK;
+
+fail:
+    free(literals); free(lengths_buf); free(offsets_buf); free(flags);
+    nex_buffer_free(&lit_comp); nex_buffer_free(&len_comp); nex_buffer_free(&off_comp);
+    return st;
+}
+
+nex_status_t nex_cascaded_decompress(const uint8_t *in, size_t in_size,
+                                      nex_buffer_t *out, int level,
+                                      const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
+
+    if (in_size < 9) return NEX_ERR_CORRUPT;
+
+    const uint8_t *p = in;
+    const uint8_t *const end = in + in_size;
+
+    uint32_t orig_lz_size; memcpy(&orig_lz_size, p, 4); p += 4;
+    uint32_t comp_data_sz; memcpy(&comp_data_sz, p, 4); p += 4;
+
+    /* Check for cascaded marker — if absent, fall back to rANS decode */
+    if (p >= end || *p != 0xCE) {
+        /* Not cascaded — try rANS/FSE fallback */
+        return nex_fse_decompress(in, in_size, out, level, dict, dict_size);
+    }
+    p++;
+
+    if (p + 24 > end) return NEX_ERR_CORRUPT;
+    uint32_t lit_count;   memcpy(&lit_count, p, 4);   p += 4;
+    uint32_t match_count; memcpy(&match_count, p, 4); p += 4;
+    uint32_t flag_bytes;  memcpy(&flag_bytes, p, 4);  p += 4;
+    uint32_t lit_comp_sz; memcpy(&lit_comp_sz, p, 4); p += 4;
+    uint32_t len_comp_sz; memcpy(&len_comp_sz, p, 4); p += 4;
+    uint32_t off_comp_sz; memcpy(&off_comp_sz, p, 4); p += 4;
+
+    /* Bounds check */
+    if (p + flag_bytes + lit_comp_sz + len_comp_sz + off_comp_sz > end)
+        return NEX_ERR_CORRUPT;
+
+    /* Read flag bitstream */
+    const uint8_t *flag_data = p; p += flag_bytes;
+
+    /* Decompress each sub-stream */
+    nex_buffer_t lit_dec = {0}, len_dec = {0}, off_dec = {0};
+    nex_status_t st;
+
+    st = cascade_decompress_substream(p, lit_comp_sz, &lit_dec);
+    if (st != NEX_OK) return st;
+    p += lit_comp_sz;
+
+    st = cascade_decompress_substream(p, len_comp_sz, &len_dec);
+    if (st != NEX_OK) { nex_buffer_free(&lit_dec); return st; }
+    p += len_comp_sz;
+
+    st = cascade_decompress_substream(p, off_comp_sz, &off_dec);
+    if (st != NEX_OK) { nex_buffer_free(&lit_dec); nex_buffer_free(&len_dec); return st; }
+
+    /* ── Reconstruct the LZ token stream ──────────────────────────── */
+    /* We need to rebuild the exact serialized format that lz_deserialize expects */
+    if (out->capacity < orig_lz_size) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, orig_lz_size + 4096);
+        if (!nd) { st = NEX_ERR_NOMEM; goto dec_fail; }
+        out->data = nd; out->capacity = orig_lz_size + 4096;
+    }
+
+    /* Reconstruct: walk flag bits, interleave literals and matches */
+    /* The original LZ format is:
+     *   [4 bytes] original_size  [4 bytes] token_count
+     *   tokens: literal runs (0x00 [count:2] [bytes...])
+     *           or matches (flags|0x01 [len:1-2] [off:1-4]) */
+
+    /* We need to figure out original_size and token_count from the sub-streams.
+     * original_size = sum of all literal lengths + sum of all match lengths
+     * We stored this data, and the flag bitstream tracks the output positions. */
+
+    /* Rebuild by walking the flag bitstream */
+    uint8_t *wp = out->data;
+    uint8_t *wp_end = out->data + out->capacity;
+
+    /* We'll compute total_decoded_size from the flags */
+    /* total output positions may be less than flag_bytes*8 due to padding */
+    /* But the actual output position might be less (last byte may have padding bits).
+     * We compute it from lit_count + sum of all match lengths. */
+
+    /* First, compute original_size from the sub-streams. */
+    uint32_t orig_size_computed = (uint32_t)lit_count;
+    const uint8_t *len_ptr = len_dec.data;
+    const uint8_t *len_end_ptr = len_dec.data + len_dec.size;
+    for (uint32_t i = 0; i < match_count && len_ptr + 2 <= len_end_ptr; i++) {
+        uint16_t mlen; memcpy(&mlen, len_ptr + i * 2, 2);
+        orig_size_computed += mlen;
+    }
+
+    /* Write LZ header */
+    memcpy(wp, &orig_size_computed, 4); wp += 4;
+    /* Token count: we count literal runs + matches.
+     * For simplicity, we reconstruct by emitting one literal run per
+     * consecutive literal segment and one match token per match. */
+    uint8_t *token_count_ptr = wp; wp += 4;
+
+    uint32_t lit_idx = 0, match_idx = 0;
+    uint32_t out_bit_pos = 0;
+    uint32_t reconstructed_tokens = 0;
+
+    uint32_t rep[REP_OFFSET_COUNT];
+    rep_offset_init(rep);
+
+    while (out_bit_pos < orig_size_computed && wp + 16 < wp_end) {
+        /* Check if this position is a literal or match start */
+        bool is_match = false;
+        if (out_bit_pos / 8 < flag_bytes) {
+            is_match = (flag_data[out_bit_pos / 8] >> (out_bit_pos % 8)) & 1;
+        }
+
+        if (!is_match) {
+            /* Collect consecutive literals */
+            uint32_t run_start = out_bit_pos;
+            while (out_bit_pos < orig_size_computed) {
+                bool m = false;
+                if (out_bit_pos / 8 < flag_bytes) {
+                    m = (flag_data[out_bit_pos / 8] >> (out_bit_pos % 8)) & 1;
+                }
+                if (m) break;
+                out_bit_pos++;
+                if (out_bit_pos - run_start >= 65535) break;
+            }
+            uint16_t run_len = (uint16_t)(out_bit_pos - run_start);
+            *wp++ = 0x00;
+            memcpy(wp, &run_len, 2); wp += 2;
+            for (uint16_t j = 0; j < run_len && lit_idx < lit_count; j++) {
+                *wp++ = lit_dec.data[lit_idx++];
+            }
+            reconstructed_tokens += run_len;
+        } else {
+            /* Match: read length and offset from sub-streams */
+            uint16_t mlen = 0;
+            uint32_t coded_offset = 0;
+
+            if (match_idx * 2 + 2 <= len_dec.size) {
+                memcpy(&mlen, len_dec.data + match_idx * 2, 2);
+            }
+            if (match_idx * 4 + 4 <= off_dec.size) {
+                memcpy(&coded_offset, off_dec.data + match_idx * 4, 4);
+            }
+            match_idx++;
+
+            /* Decode repeat offset */
+            uint32_t moff = rep_offset_decode(rep, coded_offset);
+
+            /* Serialize match token */
+            uint8_t mflags = 0x01;
+            uint8_t offset_enc_size, length_enc_size;
+
+            if (moff <= 0xFF) {
+                offset_enc_size = 1;
+            } else if (moff <= 0xFFFF) {
+                offset_enc_size = 2; mflags |= (1 << 1);
+            } else {
+                offset_enc_size = 4; mflags |= (2 << 1);
+            }
+
+            if (mlen <= 0xFF) {
+                length_enc_size = 1;
+            } else {
+                length_enc_size = 2; mflags |= (1 << 3);
+            }
+
+            *wp++ = mflags;
+            if (length_enc_size == 1) {
+                *wp++ = (uint8_t)mlen;
+            } else {
+                memcpy(wp, &mlen, 2); wp += 2;
+            }
+            if (offset_enc_size == 1) {
+                *wp++ = (uint8_t)moff;
+            } else if (offset_enc_size == 2) {
+                uint16_t off16 = (uint16_t)moff;
+                memcpy(wp, &off16, 2); wp += 2;
+            } else {
+                memcpy(wp, &moff, 4); wp += 4;
+            }
+
+            reconstructed_tokens++;
+            /* Skip flag bits for the match length */
+            out_bit_pos += mlen;
+        }
+    }
+
+    /* Backfill token count */
+    memcpy(token_count_ptr, &reconstructed_tokens, 4);
+
+    out->size = (size_t)(wp - out->data);
+
+    nex_buffer_free(&lit_dec);
+    nex_buffer_free(&len_dec);
+    nex_buffer_free(&off_dec);
+    return NEX_OK;
+
+dec_fail:
+    nex_buffer_free(&lit_dec);
+    nex_buffer_free(&len_dec);
+    nex_buffer_free(&off_dec);
+    return st;
+}
