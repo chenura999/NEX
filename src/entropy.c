@@ -1034,6 +1034,197 @@ static uint32_t rep_offset_decode(uint32_t *rep, uint32_t code) {
     return offset;
 }
 
+/* ── Innovation #3: Contextual tANS (cANS) ──────────────────────── */
+/*
+ * Order-1 context-dependent FSE for literal sub-streams.
+ * Split literals into K=4 context groups based on previous byte.
+ * Each group gets its own FSE table — captures byte-to-byte correlation.
+ *
+ * Context = prev_byte >> 6  (4 groups: 0x00-3F, 0x40-7F, 0x80-BF, 0xC0-FF)
+ *
+ * Format (marker 0xCF):
+ *   [1 byte]   0xCF
+ *   [4 bytes]  original_size
+ *   [4 bytes]  sub_stream_0 compressed size
+ *   [4 bytes]  sub_stream_1 compressed size
+ *   [4 bytes]  sub_stream_2 compressed size
+ *   [4 bytes]  sub_stream_3 compressed size
+ *   [data_0] [data_1] [data_2] [data_3]
+ */
+#define CONTEXT_K 4
+
+static inline int context_hash(uint8_t prev) {
+    return (prev >> 6) & (CONTEXT_K - 1);
+}
+
+/* Context-aware compression for literal sub-streams */
+static nex_status_t cascade_context_compress_literals(const uint8_t *data, size_t size,
+                                                        nex_buffer_t *out, int level) {
+    if (size < 32) {
+        /* Too small — context splitting overhead not worthwhile */
+        return nex_fse_compress(data, size, out, level, NULL, 0);
+    }
+
+    /* Split literals into K sub-streams based on previous-byte context */
+    uint8_t *sub[CONTEXT_K];
+    size_t sub_count[CONTEXT_K];
+    for (int k = 0; k < CONTEXT_K; k++) {
+        sub[k] = (uint8_t *)malloc(size);
+        sub_count[k] = 0;
+        if (!sub[k]) {
+            for (int j = 0; j < k; j++) free(sub[j]);
+            return NEX_ERR_NOMEM;
+        }
+    }
+
+    uint8_t prev = 0;
+    for (size_t i = 0; i < size; i++) {
+        int ctx = context_hash(prev);
+        sub[ctx][sub_count[ctx]++] = data[i];
+        prev = data[i];
+    }
+
+    /* Compress each sub-stream independently */
+    nex_buffer_t comp[CONTEXT_K];
+    memset(comp, 0, sizeof(comp));
+    nex_status_t st = NEX_OK;
+
+    for (int k = 0; k < CONTEXT_K; k++) {
+        if (sub_count[k] == 0) {
+            comp[k].size = 0;
+            continue;
+        }
+        st = nex_fse_compress(sub[k], sub_count[k], &comp[k], level, NULL, 0);
+        if (st != NEX_OK || comp[k].size >= sub_count[k]) {
+            /* FSE didn't help — use rANS fallback */
+            st = nex_rans_compress(sub[k], sub_count[k], &comp[k], level, NULL, 0);
+            if (st != NEX_OK) goto ctx_fail;
+        }
+    }
+
+    /* Check if context splitting actually helps vs flat compression */
+    size_t context_total = 1 + 4 + CONTEXT_K * 4;
+    for (int k = 0; k < CONTEXT_K; k++) context_total += comp[k].size;
+
+    /* Compare against flat FSE */
+    nex_buffer_t flat_comp = {0};
+    nex_status_t flat_st = nex_fse_compress(data, size, &flat_comp, level, NULL, 0);
+    if (flat_st != NEX_OK || flat_comp.size >= size) {
+        flat_st = nex_rans_compress(data, size, &flat_comp, level, NULL, 0);
+    }
+
+    if (flat_st == NEX_OK && flat_comp.size <= context_total) {
+        /* Flat is better — use it directly */
+        if (out->capacity < flat_comp.size) {
+            uint8_t *nd = (uint8_t *)realloc(out->data, flat_comp.size);
+            if (!nd) { nex_buffer_free(&flat_comp); st = NEX_ERR_NOMEM; goto ctx_fail; }
+            out->data = nd; out->capacity = flat_comp.size;
+        }
+        memcpy(out->data, flat_comp.data, flat_comp.size);
+        out->size = flat_comp.size;
+        nex_buffer_free(&flat_comp);
+        for (int k = 0; k < CONTEXT_K; k++) { free(sub[k]); nex_buffer_free(&comp[k]); }
+        return NEX_OK;
+    }
+    nex_buffer_free(&flat_comp);
+
+    /* Context splitting wins — pack it */
+    if (out->capacity < context_total) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, context_total);
+        if (!nd) { st = NEX_ERR_NOMEM; goto ctx_fail; }
+        out->data = nd; out->capacity = context_total;
+    }
+
+    uint8_t *wp = out->data;
+    *wp++ = 0xCF;  /* Context FSE marker */
+    uint32_t orig32 = (uint32_t)size;
+    memcpy(wp, &orig32, 4); wp += 4;
+    for (int k = 0; k < CONTEXT_K; k++) {
+        uint32_t csz = (uint32_t)comp[k].size;
+        memcpy(wp, &csz, 4); wp += 4;
+    }
+    for (int k = 0; k < CONTEXT_K; k++) {
+        if (comp[k].size > 0) {
+            memcpy(wp, comp[k].data, comp[k].size);
+            wp += comp[k].size;
+        }
+    }
+    out->size = (size_t)(wp - out->data);
+
+    for (int k = 0; k < CONTEXT_K; k++) { free(sub[k]); nex_buffer_free(&comp[k]); }
+    return NEX_OK;
+
+ctx_fail:
+    for (int k = 0; k < CONTEXT_K; k++) { free(sub[k]); nex_buffer_free(&comp[k]); }
+    return st;
+}
+
+/* Context-aware decompression for literal sub-streams */
+static nex_status_t cascade_context_decompress_literals(const uint8_t *data, size_t size,
+                                                          nex_buffer_t *out) {
+    if (size < 1 || data[0] != 0xCF) {
+        /* Not context-encoded — use standard decompress */
+        return nex_fse_decompress(data, size, out, 0, NULL, 0);
+    }
+
+    const uint8_t *p = data + 1;
+    const uint8_t *end = data + size;
+
+    if (p + 4 + CONTEXT_K * 4 > end) return NEX_ERR_CORRUPT;
+
+    uint32_t orig_size; memcpy(&orig_size, p, 4); p += 4;
+    uint32_t comp_sizes[CONTEXT_K];
+    for (int k = 0; k < CONTEXT_K; k++) {
+        memcpy(&comp_sizes[k], p, 4); p += 4;
+    }
+
+    /* Decompress each context sub-stream */
+    nex_buffer_t dec[CONTEXT_K];
+    memset(dec, 0, sizeof(dec));
+
+    for (int k = 0; k < CONTEXT_K; k++) {
+        if (comp_sizes[k] == 0) continue;
+        if (p + comp_sizes[k] > end) {
+            for (int j = 0; j < k; j++) nex_buffer_free(&dec[j]);
+            return NEX_ERR_CORRUPT;
+        }
+        nex_status_t st = nex_fse_decompress(p, comp_sizes[k], &dec[k], 0, NULL, 0);
+        if (st != NEX_OK) {
+            for (int j = 0; j <= k; j++) nex_buffer_free(&dec[j]);
+            return st;
+        }
+        p += comp_sizes[k];
+    }
+
+    /* Reconstruct: interleave sub-streams based on context */
+    if (out->capacity < orig_size) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, orig_size);
+        if (!nd) {
+            for (int k = 0; k < CONTEXT_K; k++) nex_buffer_free(&dec[k]);
+            return NEX_ERR_NOMEM;
+        }
+        out->data = nd; out->capacity = orig_size;
+    }
+
+    size_t read_pos[CONTEXT_K];
+    memset(read_pos, 0, sizeof(read_pos));
+
+    uint8_t prev = 0;
+    for (uint32_t i = 0; i < orig_size; i++) {
+        int ctx = context_hash(prev);
+        if (read_pos[ctx] < dec[ctx].size) {
+            out->data[i] = dec[ctx].data[read_pos[ctx]++];
+        } else {
+            out->data[i] = 0;  /* should not happen with valid data */
+        }
+        prev = out->data[i];
+    }
+    out->size = orig_size;
+
+    for (int k = 0; k < CONTEXT_K; k++) nex_buffer_free(&dec[k]);
+    return NEX_OK;
+}
+
 /* Compress a raw byte sub-stream using FSE, with rANS fallback.
  * Returns compressed block in `out`. */
 static nex_status_t cascade_compress_substream(const uint8_t *data, size_t size,
@@ -1058,9 +1249,14 @@ static nex_status_t cascade_decompress_substream(const uint8_t *data, size_t siz
         out->size = 0;
         return NEX_OK;
     }
+    /* Check for context FSE marker first */
+    if (size >= 1 && data[0] == 0xCF) {
+        return cascade_context_decompress_literals(data, size, out);
+    }
     /* nex_fse_decompress auto-detects 0xFE marker and falls back to rANS */
     return nex_fse_decompress(data, size, out, 0, NULL, 0);
 }
+
 
 nex_status_t nex_cascaded_compress(const uint8_t *in, size_t in_size,
                                     nex_buffer_t *out, int level,
@@ -1183,7 +1379,7 @@ nex_status_t nex_cascaded_compress(const uint8_t *in, size_t in_size,
     nex_buffer_t lit_comp = {0}, len_comp = {0}, off_comp = {0};
 
     nex_status_t st;
-    st = cascade_compress_substream(literals, lit_count, &lit_comp, level);
+    st = cascade_context_compress_literals(literals, lit_count, &lit_comp, level);
     if (st != NEX_OK) goto fail;
 
     st = cascade_compress_substream(lengths_buf, len_buf_pos, &len_comp, level);
