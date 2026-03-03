@@ -583,12 +583,14 @@ nex_status_t nex_huffman_decompress(const uint8_t *in, size_t in_size,
  * Table size: 2048 entries (11-bit log), giving good compression
  * while keeping tables L1-cache friendly (~16KB encode, ~8KB decode).
  *
- * Stream format:
- *   [4 bytes]  original size
- *   [4 bytes]  compressed data size (including freq table)
- *   [512 bytes] normalized frequency table (256 × uint16)
- *   [N bytes]  FSE-encoded bitstream
- *   [2 bytes]  final state
+ * Stream format (compact):
+ *   [4 bytes]    original size
+ *   [4 bytes]    compressed data size
+ *   [1 byte]     0xFE format marker
+ *   [1 byte]     maxSymbolValue (M)
+ *   [(M+1)*2 B]  normalized freq table (symbols 0..M)
+ *   [1 byte]     pad_bits (0-7)
+ *   [N bytes]    FSE-encoded bitstream
  * ═══════════════════════════════════════════════════════════════════ */
 
 #define FSE_TABLE_LOG   11
@@ -641,23 +643,17 @@ static void fse_normalize_freqs(const uint8_t *data, size_t size,
     }
 }
 
-/* ── Build decode table ──────────────────────────────────────────── */
+/* ── Build decode table (classic tANS) ───────────────────────────── */
 
 static void fse_build_decode_table(const uint16_t *norm_freq,
                                     fse_dec_entry_t *decode_table) {
-    /* Spread symbols across the table using a step function */
-    uint16_t cum_freq[257];
-    cum_freq[0] = 0;
-    for (int i = 0; i < 256; i++) {
-        cum_freq[i + 1] = cum_freq[i] + norm_freq[i];
-    }
-
-    /* Simple symbol spreading: assign symbols to states */
+    /* Spread symbols across the table using a step function.
+     * This is the standard tANS symbol spread from FSE/Zstd. */
     uint16_t pos = 0;
     uint16_t step = (FSE_TABLE_SIZE >> 1) + (FSE_TABLE_SIZE >> 3) + 3;
     uint16_t mask = FSE_TABLE_SIZE - 1;
-
     uint8_t symbol_table[FSE_TABLE_SIZE];
+
     for (int sym = 0; sym < 256; sym++) {
         for (uint16_t i = 0; i < norm_freq[sym]; i++) {
             symbol_table[pos] = (uint8_t)sym;
@@ -665,28 +661,54 @@ static void fse_build_decode_table(const uint16_t *norm_freq,
         }
     }
 
-    /* Build decode entries */
+    /* Build decode entries: for each table position, compute nb_bits and baseline.
+     * next_state[sym] tracks the sequential allocation within each symbol.
+     * For the j-th occurrence of symbol sym, next_state starts at freq
+     * and increments. nb_bits = TABLE_LOG - highbit(next_state),
+     * baseline = (next_state << nb_bits) - TABLE_SIZE.
+     * This ensures the decoded state is always in [0, TABLE_SIZE). */
     uint16_t next_state[256];
     for (int i = 0; i < 256; i++) next_state[i] = norm_freq[i];
 
     for (int i = 0; i < FSE_TABLE_SIZE; i++) {
         uint8_t sym = symbol_table[i];
         uint16_t freq = norm_freq[sym];
-
         if (freq == 0) continue;
 
-        /* Calculate bits to read and base */
-        int nb_bits = FSE_TABLE_LOG - (31 - __builtin_clz(freq));
+        uint16_t ns = next_state[sym];
+        int high_bit = 31 - __builtin_clz((unsigned)ns);
+        int nb_bits = FSE_TABLE_LOG - high_bit;
         if (nb_bits < 0) nb_bits = 0;
 
         decode_table[i].symbol = sym;
         decode_table[i].nb_bits = (uint8_t)nb_bits;
-        decode_table[i].base = (uint16_t)(((uint32_t)next_state[sym] << nb_bits) - FSE_TABLE_SIZE);
+        decode_table[i].base = (uint16_t)(((uint32_t)ns << nb_bits) - FSE_TABLE_SIZE);
+
         next_state[sym]++;
     }
 }
 
-/* ── FSE Compress ────────────────────────────────────────────────── */
+/* ── FSE Compress (production-grade classic tANS) ────────────────── */
+/*
+ * Implementation follows the standard tANS algorithm used by Zstd/FSE.
+ *
+ * Encoder state machine:
+ *   - State ∈ [TABLE_SIZE, 2*TABLE_SIZE)
+ *   - For each symbol (backward), compute nbBitsOut using the packed
+ *     deltaNbBits formula from Yann Collet's reference FSE:
+ *       nbBitsOut = (state + deltaNbBits[sym]) >> 16
+ *     Output nbBitsOut low bits, shift state, look up new state.
+ *
+ * Two-pass encoding:
+ *   Pass 1: Run tANS backward, collect (nb_bits, bits) pairs.
+ *   Pass 2: Write pairs forward into a flat bitstream.
+ *   This eliminates bit-ordering ambiguity between encoder/decoder.
+ *
+ * Decoder state machine:
+ *   - State is a table index ∈ [0, TABLE_SIZE)
+ *   - For each symbol, look up {symbol, nb_bits, baseline} from decode_table
+ *   - Read nb_bits from bitstream, next_state = baseline + bits
+ */
 
 nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
                                nex_buffer_t *out, int level,
@@ -694,8 +716,6 @@ nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
     (void)level; (void)dict; (void)dict_size;
 
     if (in_size == 0) { out->size = 0; return NEX_OK; }
-
-    /* For very small data or incompressible data, fall through to rANS */
     if (in_size < 64) {
         return nex_rans_compress(in, in_size, out, level, dict, dict_size);
     }
@@ -704,104 +724,157 @@ nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
     uint16_t norm_freq[256];
     fse_normalize_freqs(in, in_size, norm_freq);
 
-    /* Build decode table (needed for encode state mapping) */
+    /* Build decode table */
     fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
     fse_build_decode_table(norm_freq, decode_table);
 
-    /* Build encode table by inverting the decode table */
-    /* For each symbol, build a list of (state -> encode_entry) */
-    /* We use the cumulative frequencies as state indices */
+    /* Build sorted_table: for each (symbol, j-th occurrence) → table position.
+     * This inverts the decode table's symbol→position mapping. */
     uint16_t cum_freq[257];
     cum_freq[0] = 0;
-    for (int i = 0; i < 256; i++) {
+    for (int i = 0; i < 256; i++)
         cum_freq[i + 1] = cum_freq[i] + norm_freq[i];
+
+    uint16_t sorted_table[FSE_TABLE_SIZE];
+    uint16_t sym_occ[256];
+    memset(sym_occ, 0, sizeof(sym_occ));
+    for (int i = 0; i < FSE_TABLE_SIZE; i++) {
+        uint8_t sym = decode_table[i].symbol;
+        sorted_table[cum_freq[sym] + sym_occ[sym]] = (uint16_t)i;
+        sym_occ[sym]++;
     }
 
-    /* Allocate output: header + freq table + bitstream */
-    size_t max_out = 8 + 512 + in_size + 256;
-    if (out->capacity < max_out) {
-        uint8_t *new_data = (uint8_t *)realloc(out->data, max_out);
-        if (!new_data) return NEX_ERR_NOMEM;
-        out->data = new_data;
-        out->capacity = max_out;
+    /* Build per-symbol encode parameters.
+     * Reference deltaNbBits/deltaFindState from Yann Collet's FSE:
+     *   For freq f > 1:
+     *     maxBitsOut = TL - highbit(f-1)
+     *     minStatePlus = f << maxBitsOut
+     *     deltaNbBits = (maxBitsOut << 16) - minStatePlus
+     *     deltaFindState = cumFreq[s] - f
+     *   For freq f == 1:
+     *     deltaNbBits = (TL << 16) - TABLE_SIZE
+     *     deltaFindState = cumFreq[s] - 1
+     *   For freq f == 0:
+     *     deltaNbBits = ((TL+1) << 16) - TABLE_SIZE  (always too large → fallback)
+     */
+    uint32_t delta_nb_bits[256];
+    int32_t delta_find_state[256];
+    for (int s = 0; s < 256; s++) {
+        uint16_t f = norm_freq[s];
+        if (f == 0) {
+            delta_nb_bits[s] = ((FSE_TABLE_LOG + 1) << 16) - FSE_TABLE_SIZE;
+            delta_find_state[s] = 0;
+        } else if (f == 1) {
+            delta_nb_bits[s] = ((uint32_t)FSE_TABLE_LOG << 16) - FSE_TABLE_SIZE;
+            delta_find_state[s] = (int32_t)cum_freq[s] - 1;
+        } else {
+            int max_bits_out = FSE_TABLE_LOG - (31 - __builtin_clz((unsigned)(f - 1)));
+            uint32_t min_state_plus = (uint32_t)f << max_bits_out;
+            delta_nb_bits[s] = ((uint32_t)max_bits_out << 16) - min_state_plus;
+            delta_find_state[s] = (int32_t)cum_freq[s] - (int32_t)f;
+        }
     }
 
-    /* Temporary bitstream buffer (written backwards) */
-    uint8_t *bitstream = (uint8_t *)malloc(in_size + 256);
-    if (!bitstream) return NEX_ERR_NOMEM;
-    uint8_t *bit_ptr = bitstream + in_size + 256;
+    /* Pass 1: backward tANS, collect (nb_bits, bits_value) ops */
+    typedef struct { uint8_t nb; uint16_t bits; } fse_op_t;
+    fse_op_t *ops = (fse_op_t *)malloc((in_size + 1) * sizeof(fse_op_t));
+    if (!ops) return NEX_ERR_NOMEM;
 
-    /* Encode backwards using the decode table for state transitions */
-    uint16_t state = FSE_TABLE_SIZE; /* initial state */
+    uint32_t state = FSE_TABLE_SIZE;  /* initial encoder state */
+    size_t n_ops = 0;
 
     for (size_t i = in_size; i > 0; i--) {
         uint8_t sym = in[i - 1];
         uint16_t freq = norm_freq[sym];
-
         if (freq == 0) {
-            /* Shouldn't happen with normalized freqs, but safety */
-            free(bitstream);
+            free(ops);
             return nex_rans_compress(in, in_size, out, level, dict, dict_size);
         }
 
-        /* Normalize state: output bits until state is in valid range */
-        int nb_bits = FSE_TABLE_LOG - (31 - __builtin_clz(freq));
-        if (nb_bits < 0) nb_bits = 0;
-        uint16_t max_state = (uint16_t)((uint32_t)freq << (nb_bits + 1));
+        uint32_t nbo = (state + delta_nb_bits[sym]) >> 16;
+        ops[n_ops].nb   = (uint8_t)nbo;
+        ops[n_ops].bits = (uint16_t)(state & ((1U << nbo) - 1));
+        n_ops++;
 
-        while (state >= max_state) {
-            *--bit_ptr = (uint8_t)(state & 0xFF);
-            state >>= 8;
-        }
-
-        /* Transition: find the decode table entry and compute new state */
-        /* state -> cum_freq[sym] + (state - freq) where state is in [freq, 2*freq) */
-        /* Simplified: we need state to map into the symbol's range */
-        uint16_t new_state = (uint16_t)(cum_freq[sym] + (state % freq));
-        if (new_state < FSE_TABLE_SIZE) {
-            state = (uint16_t)(new_state + FSE_TABLE_SIZE);
-        } else {
-            state = new_state;
-        }
-
-        /* Keep state in valid range */
-        if (state >= 2 * FSE_TABLE_SIZE) state = FSE_TABLE_SIZE;
+        state >>= nbo;
+        /* state now ∈ [freq, 2*freq). Index into sorted_table. */
+        state = sorted_table[state + delta_find_state[sym]] + FSE_TABLE_SIZE;
     }
 
+    /* Store final state as TABLE_LOG bits */
+    ops[n_ops].nb   = FSE_TABLE_LOG;
+    ops[n_ops].bits = (uint16_t)(state - FSE_TABLE_SIZE);
+    n_ops++;
+
+    /* Pass 2: write ops in REVERSE order (so decoder reads forward) */
+    size_t bs_cap = in_size * 2 + 256;
+    uint8_t *bs_buf = (uint8_t *)malloc(bs_cap);
+    if (!bs_buf) { free(ops); return NEX_ERR_NOMEM; }
+
+    uint64_t bit_buf = 0;
+    int bit_pos = 0;
+    size_t bs_len = 0;
+
+    for (size_t j = n_ops; j > 0; j--) {
+        uint32_t nb = ops[j - 1].nb;
+        uint32_t bits = ops[j - 1].bits;
+        bit_buf = (bit_buf << nb) | bits;
+        bit_pos += (int)nb;
+        while (bit_pos >= 8) {
+            bit_pos -= 8;
+            if (bs_len >= bs_cap) {
+                free(ops); free(bs_buf);
+                return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+            }
+            bs_buf[bs_len++] = (uint8_t)(bit_buf >> bit_pos);
+            bit_buf &= (1ULL << bit_pos) - 1;
+        }
+    }
+
+    uint8_t pad_bits = 0;
+    if (bit_pos > 0) {
+        pad_bits = (uint8_t)(8 - bit_pos);
+        bs_buf[bs_len++] = (uint8_t)(bit_buf << pad_bits);
+    }
+    free(ops);
+
+    /* Find maxSymbolValue for compact header */
+    int max_sym = 255;
+    while (max_sym > 0 && norm_freq[max_sym] == 0) max_sym--;
+    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
+
     /* Write output */
+    size_t max_out = 8 + 1 + 1 + freq_bytes + 1 + bs_len + 16;
+    if (out->capacity < max_out) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, max_out);
+        if (!nd) { free(bs_buf); return NEX_ERR_NOMEM; }
+        out->data = nd; out->capacity = max_out;
+    }
+
     uint8_t *p = out->data;
     uint32_t orig_size = (uint32_t)in_size;
     memcpy(p, &orig_size, 4); p += 4;
+    uint8_t *csz_ptr = p; p += 4;
 
-    /* Placeholder for compressed size */
-    uint8_t *comp_size_ptr = p;
-    p += 4;
+    *p++ = 0xFE;  /* FSE format marker */
+    *p++ = (uint8_t)max_sym;  /* compact: only write freq[0..maxSym] */
+    memcpy(p, norm_freq, freq_bytes); p += freq_bytes;
+    *p++ = pad_bits;
+    memcpy(p, bs_buf, bs_len); p += bs_len;
+    free(bs_buf);
 
-    /* Write normalized frequency table */
-    memcpy(p, norm_freq, 512); p += 512;
-
-    /* Write final state */
-    memcpy(p, &state, 2); p += 2;
-
-    /* Write bitstream (from bit_ptr to end) */
-    size_t bs_size = (size_t)(bitstream + in_size + 256 - bit_ptr);
-    memcpy(p, bit_ptr, bs_size); p += bs_size;
-
-    uint32_t comp_data_size = (uint32_t)(p - out->data - 8);
-    memcpy(comp_size_ptr, &comp_data_size, 4);
-
+    uint32_t cds = (uint32_t)(p - out->data - 8);
+    memcpy(csz_ptr, &cds, 4);
     out->size = (size_t)(p - out->data);
-    free(bitstream);
 
     /* If FSE didn't compress well, fall back to rANS */
     if (out->size >= in_size) {
         return nex_rans_compress(in, in_size, out, level, dict, dict_size);
     }
-
     return NEX_OK;
 }
 
-/* ── FSE Decompress ──────────────────────────────────────────────── */
+/* ── FSE Decompress (production-grade with forward bit reader) ───── */
 
 nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
                                  nex_buffer_t *out, int level,
@@ -809,79 +882,87 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
     (void)level; (void)dict; (void)dict_size;
 
     if (in_size < 8) return NEX_ERR_CORRUPT;
-
     const uint8_t *p = in;
+    const uint8_t *const in_end = in + in_size;
 
-    uint32_t orig_size;
-    memcpy(&orig_size, p, 4); p += 4;
+    uint32_t orig_size; memcpy(&orig_size, p, 4); p += 4;
+    uint32_t comp_data_size; memcpy(&comp_data_size, p, 4); p += 4;
 
-    uint32_t comp_data_size;
-    memcpy(&comp_data_size, p, 4); p += 4;
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
 
-    /* Check if this is actually rANS encoded (fallback detection) */
-    /* rANS header starts with orig_size then comp_size, and comp_size
-       includes the 2048-byte freq table. FSE uses 512-byte table. */
-    if (comp_data_size > in_size - 8) {
-        /* Might be rANS format — try rANS decoder */
+    /* Check for FSE format marker (0xFE) — if absent, fall back to rANS */
+    if (comp_data_size > in_size - 8 || p >= in_end || *p != 0xFE) {
         return nex_rans_decompress(in, in_size, out, level, dict, dict_size);
     }
+    p++;
 
-    if (p + 512 > in + in_size) return NEX_ERR_CORRUPT;
+    if (p >= in_end) return NEX_ERR_CORRUPT;
+    int max_sym = *p++;
+    if (max_sym > 255) return NEX_ERR_CORRUPT;
+    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
+    if (p + freq_bytes > in_end) return NEX_ERR_CORRUPT;
 
-    /* Read frequency table */
     uint16_t norm_freq[256];
-    memcpy(norm_freq, p, 512); p += 512;
+    memset(norm_freq, 0, sizeof(norm_freq));
+    memcpy(norm_freq, p, freq_bytes); p += freq_bytes;
 
-    /* Read initial state */
-    if (p + 2 > in + in_size) return NEX_ERR_CORRUPT;
-    uint16_t state;
-    memcpy(&state, p, 2); p += 2;
+    if (p >= in_end) return NEX_ERR_CORRUPT;
+    uint8_t pad_bits = *p++;
+    if (pad_bits >= 8) return NEX_ERR_CORRUPT;
 
     /* Build decode table */
     fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
     fse_build_decode_table(norm_freq, decode_table);
 
-    /* Build cumulative frequencies */
-    uint16_t cum_freq[257];
-    cum_freq[0] = 0;
-    for (int i = 0; i < 256; i++) {
-        cum_freq[i + 1] = cum_freq[i] + norm_freq[i];
-    }
-
     /* Ensure output buffer */
     if (out->capacity < orig_size) {
-        uint8_t *new_data = (uint8_t *)realloc(out->data, orig_size);
-        if (!new_data) return NEX_ERR_NOMEM;
-        out->data = new_data;
-        out->capacity = orig_size;
+        uint8_t *nd = (uint8_t *)realloc(out->data, orig_size);
+        if (!nd) return NEX_ERR_NOMEM;
+        out->data = nd; out->capacity = orig_size;
     }
 
-    /* Decode forward */
-    const uint8_t *bs_ptr = p;
-    const uint8_t *bs_end = in + in_size;
+    /* Forward bit reader (MSB-first packing) */
+    const uint8_t *bs = p;
+    size_t bs_len = (size_t)(in_end - bs);
+    if (bs_len == 0) return NEX_ERR_CORRUPT;
+
+    uint64_t bit_buf = 0;
+    int bit_count = 0;
     size_t bs_pos = 0;
 
+    #define FSE_REFILL() do { \
+        while (bit_count < 56 && bs_pos < bs_len) { \
+            bit_buf = (bit_buf << 8) | bs[bs_pos++]; \
+            bit_count += 8; \
+        } \
+    } while(0)
+
+    #define FSE_READ_BITS(n) ({ \
+        FSE_REFILL(); \
+        bit_count -= (int)(n); \
+        (uint32_t)((bit_buf >> bit_count) & ((1U << (n)) - 1)); \
+    })
+
+    /* Read initial state as table index [0, TABLE_SIZE) */
+    uint32_t state = FSE_READ_BITS(FSE_TABLE_LOG);
+
+    /* Decode loop */
     for (uint32_t i = 0; i < orig_size; i++) {
-        /* Bring state into decode range */
-        while (state < FSE_TABLE_SIZE && bs_ptr + bs_pos < bs_end) {
-            state = (uint16_t)((state << 8) | bs_ptr[bs_pos]);
-            bs_pos++;
-        }
+        if (state >= FSE_TABLE_SIZE) { out->size = i; return NEX_ERR_CORRUPT; }
 
-        /* Decode symbol from state */
-        uint16_t idx = state & (FSE_TABLE_SIZE - 1);
-        if (idx >= FSE_TABLE_SIZE) return NEX_ERR_CORRUPT;
-
-        fse_dec_entry_t entry = decode_table[idx];
+        fse_dec_entry_t entry = decode_table[state];
         out->data[i] = entry.symbol;
 
-        /* Transition to next state */
-        state = entry.base + (state >> entry.nb_bits);
-        if (state < FSE_TABLE_SIZE) {
-            state = (uint16_t)(state + FSE_TABLE_SIZE);
-        }
+        uint32_t nb = entry.nb_bits;
+        uint32_t bits = (nb > 0) ? FSE_READ_BITS(nb) : 0;
+        state = (uint32_t)entry.base + bits;
     }
+
+    #undef FSE_READ_BITS
+    #undef FSE_REFILL
 
     out->size = orig_size;
     return NEX_OK;
 }
+
+

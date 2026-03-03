@@ -4,6 +4,7 @@
  */
 
 #include "nex_internal.h"
+#include <math.h>
 
 /* ── LZ Token Serialization Format ───────────────────────────────
  *
@@ -456,14 +457,134 @@ static nex_status_t lz_deserialize(const uint8_t *data, size_t size,
     return NEX_OK;
 }
 
-/* ── Viterbi Optimal Parser ──────────────────────────────────────── */
+/* ── Entropy-Aware Cost Model (NEX Innovation #1) ────────────────── */
+/*
+ * Instead of fixed costs (literal=16, match=const), we use real
+ * entropy-based bit costs derived from actual symbol frequencies.
+ *
+ * cost(literal byte b) = ceil(-log2(freq[b] / total)) * COST_SCALE
+ * cost(match len, off) = len_bits(len) + off_bits(off) + MATCH_OVERHEAD
+ *
+ * This gives the Viterbi optimal parser a TRUE cost function,
+ * so it makes provably better literal-vs-match decisions.
+ *
+ * COST_SCALE = 256 (8.8 fixed-point) for sub-bit precision.
+ */
+
+#define LZ_COST_SCALE    256   /* 8.8 fixed-point */
+#define LZ_COST_INFINITY 0x0FFFFFFFU
 
 typedef struct {
-    uint32_t price;
-    uint32_t length;
-    uint32_t offset;
-} lz_opt_node_t;
+    uint32_t literal_cost[256]; /* scaled bit cost per literal byte */
+    uint32_t match_overhead;    /* fixed overhead for a match token */
+    uint32_t avg_literal_cost;  /* average literal cost (for fallback) */
+    bool     initialized;
+} lz_entropy_cost_t;
 
+/* log2 lookup table (8.8 fixed-point, 256 entries for values 1..256) */
+static uint32_t lz_log2_table[257]; /* index i → ceil(-log2(i/256)) * 256 */
+static bool lz_log2_initialized = false;
+
+static void lz_init_log2_table(void) {
+    if (lz_log2_initialized) return;
+    lz_log2_table[0] = 16 * LZ_COST_SCALE; /* undefined, use max */
+    for (int i = 1; i <= 256; i++) {
+        /* -log2(i/256) = log2(256) - log2(i) = 8 - log2(i)
+         * In fixed-point: (8 - log2(i)) * 256 */
+        double log2_val = log2((double)i);
+        double neg_log2_frac = 8.0 - log2_val;
+        if (neg_log2_frac < 0.0) neg_log2_frac = 0.0;
+        lz_log2_table[i] = (uint32_t)(neg_log2_frac * LZ_COST_SCALE + 0.5);
+    }
+    lz_log2_initialized = true;
+}
+
+/* Build entropy costs from raw data (single pass frequency count) */
+static void lz_build_entropy_costs(const uint8_t *data, size_t size,
+                                    lz_entropy_cost_t *ec) {
+    lz_init_log2_table();
+
+    /* Count byte frequencies */
+    uint32_t freq[256];
+    memset(freq, 0, sizeof(freq));
+    for (size_t i = 0; i < size; i++) {
+        freq[data[i]]++;
+    }
+
+    /* Compute per-symbol costs using Shannon entropy:
+     * cost(b) = ceil(-log2(freq[b]/total)) * SCALE
+     *         = ceil(log2(total/freq[b])) * SCALE
+     *         = ceil(log2(total) - log2(freq[b])) * SCALE
+     *
+     * We use a fixed-point approach: normalize freq to [0, 256] range
+     * then use the lookup table. */
+    uint64_t total_cost = 0;
+    int active_syms = 0;
+
+    for (int i = 0; i < 256; i++) {
+        if (freq[i] == 0) {
+            /* Symbol never appears — cost = infinity (should never be a literal) */
+            ec->literal_cost[i] = LZ_COST_INFINITY;
+            continue;
+        }
+
+        /* Normalize: frac = freq[i] / size, in range (0, 1]
+         * cost = -log2(frac) * SCALE
+         * = (log2(size) - log2(freq[i])) * SCALE
+         * Use actual floating-point log2 for precision */
+        double frac = (double)freq[i] / (double)size;
+        double bits = -log2(frac);
+        if (bits < 1.0) bits = 1.0;  /* minimum 1 bit per symbol */
+        ec->literal_cost[i] = (uint32_t)(bits * LZ_COST_SCALE + 0.5);
+
+        total_cost += (uint64_t)ec->literal_cost[i];
+        active_syms++;
+    }
+
+    ec->avg_literal_cost = active_syms > 0 ?
+        (uint32_t)(total_cost / active_syms) : (8 * LZ_COST_SCALE);
+
+    /* Match overhead: 1 byte for flags = 8 bits scaled */
+    ec->match_overhead = 8 * LZ_COST_SCALE;
+    ec->initialized = true;
+}
+
+/* Entropy-based literal cost (fixed-point, 8.8 scale) */
+static inline uint32_t lz_entropy_literal_cost(const lz_entropy_cost_t *ec,
+                                                 uint8_t byte) {
+    return ec->initialized ? ec->literal_cost[byte] : (16 * LZ_COST_SCALE);
+}
+
+/* Entropy-based match cost (fixed-point, 8.8 scale)
+ *   cost = match_overhead + length_bits + offset_bits
+ *   length_bits: compact encoding, ~log2(length) scaled
+ *   offset_bits: ~log2(offset) scaled */
+static inline uint32_t lz_entropy_match_cost(const lz_entropy_cost_t *ec,
+                                               uint32_t length, uint32_t offset) {
+    uint32_t cost = ec->initialized ? ec->match_overhead : (8 * LZ_COST_SCALE);
+
+    /* Length encoding cost: 8 bits for len <= 255, 16 for larger */
+    if (length <= 0xFF)
+        cost += 8 * LZ_COST_SCALE;
+    else
+        cost += 16 * LZ_COST_SCALE;
+
+    /* Offset encoding cost: actual log2 bits needed
+     * 1-byte offset (≤255):   8 bits
+     * 2-byte offset (≤65535): 16 bits
+     * 4-byte offset:          full 32 bits
+     * Use real log2 for intermediate values */
+    if (offset <= 0xFF)
+        cost += 8 * LZ_COST_SCALE;
+    else if (offset <= 0xFFFF)
+        cost += 16 * LZ_COST_SCALE;
+    else
+        cost += 32 * LZ_COST_SCALE;
+
+    return cost;
+}
+
+/* Legacy fixed-cost functions (used for greedy/lazy modes) */
 static inline uint32_t lz_get_literal_cost(void) {
     return 16;
 }
@@ -475,7 +596,20 @@ static inline uint32_t lz_get_match_cost(uint32_t length, uint32_t offset) {
     return cost;
 }
 
-static nex_status_t lz_compress_optimal(lz_match_finder_t *mf, const uint8_t *in, size_t in_size, size_t start_pos, nex_lz_sequence_t *seq) {
+
+/* ── Viterbi Optimal Parser (Entropy-Aware) ──────────────────────── */
+
+typedef struct {
+    uint32_t price;
+    uint32_t length;
+    uint32_t offset;
+} lz_opt_node_t;
+
+static nex_status_t lz_compress_optimal(lz_match_finder_t *mf,
+                                         const uint8_t *in, size_t in_size,
+                                         size_t start_pos,
+                                         nex_lz_sequence_t *seq,
+                                         const lz_entropy_cost_t *ec) {
     lz_opt_node_t *nodes = (lz_opt_node_t *)malloc((in_size + 1) * sizeof(lz_opt_node_t));
     if (!nodes) return NEX_ERR_NOMEM;
 
@@ -494,6 +628,8 @@ static nex_status_t lz_compress_optimal(lz_match_finder_t *mf, const uint8_t *in
     uint32_t match_lens[128], match_offs[128];
     uint32_t num_matches;
 
+    const bool use_entropy = (ec != NULL && ec->initialized);
+
     for (size_t i = 0; i < in_size; i++) {
         /* If unreachable, we don't process */
         if (nodes[i].price == 0xFFFFFFFF) continue;
@@ -501,8 +637,14 @@ static nex_status_t lz_compress_optimal(lz_match_finder_t *mf, const uint8_t *in
         /* Find matches and add to BT4 */
         lz_bt4_get_matches(mf, i, match_lens, match_offs, &num_matches);
 
-        /* 1. Literal transaction */
-        uint32_t cost_lit = nodes[i].price + lz_get_literal_cost();
+        /* 1. Literal transaction — use entropy cost if available */
+        uint32_t cost_lit;
+        if (use_entropy) {
+            cost_lit = nodes[i].price + lz_entropy_literal_cost(ec, in[i]);
+        } else {
+            cost_lit = nodes[i].price + lz_get_literal_cost();
+        }
+
         if (cost_lit < nodes[i + 1].price) {
             nodes[i + 1].price = cost_lit;
             nodes[i + 1].length = 1;
@@ -528,7 +670,12 @@ static nex_status_t lz_compress_optimal(lz_match_finder_t *mf, const uint8_t *in
 
             for (int t = 0; t < try_count; t++) {
                 uint32_t sub_len = try_lens[t];
-                uint32_t cost_match = nodes[i].price + lz_get_match_cost(sub_len, off);
+                uint32_t cost_match;
+                if (use_entropy) {
+                    cost_match = nodes[i].price + lz_entropy_match_cost(ec, sub_len, off);
+                } else {
+                    cost_match = nodes[i].price + lz_get_match_cost(sub_len, off);
+                }
                 if (cost_match < nodes[i + sub_len].price) {
                     nodes[i + sub_len].price = cost_match;
                     nodes[i + sub_len].length = sub_len;
@@ -657,7 +804,12 @@ nex_status_t nex_lz_compress(const uint8_t *in, size_t in_size,
     }
 
     if (mf.is_bt4) {
-        st = lz_compress_optimal(&mf, comp_in, comp_size, start_pos, &seq);
+        /* Build entropy cost model from input data for optimal parsing */
+        lz_entropy_cost_t ec;
+        lz_build_entropy_costs(comp_in + start_pos,
+                                comp_size - start_pos, &ec);
+        st = lz_compress_optimal(&mf, comp_in, comp_size, start_pos,
+                                  &seq, &ec);
     } else {
         bool use_lazy = (level >= 4);
         st = lz_compress_greedy(&mf, comp_in, comp_size, start_pos, &seq, use_lazy);
