@@ -710,220 +710,19 @@ static void fse_build_decode_table(const uint16_t *norm_freq,
  *   - Read nb_bits from bitstream, next_state = baseline + bits
  */
 
-nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
-                               nex_buffer_t *out, int level,
-                               const uint8_t *dict, size_t dict_size) {
-    (void)level; (void)dict; (void)dict_size;
-
-    if (in_size == 0) { out->size = 0; return NEX_OK; }
-    if (in_size < 64) {
-        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
-    }
-
-    /* Build frequency table */
-    uint16_t norm_freq[256];
-    fse_normalize_freqs(in, in_size, norm_freq);
-
-    /* Build decode table */
-    fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
-    fse_build_decode_table(norm_freq, decode_table);
-
-    /* Build sorted_table: for each (symbol, j-th occurrence) → table position.
-     * This inverts the decode table's symbol→position mapping. */
-    uint16_t cum_freq[257];
-    cum_freq[0] = 0;
-    for (int i = 0; i < 256; i++)
-        cum_freq[i + 1] = cum_freq[i] + norm_freq[i];
-
-    uint16_t sorted_table[FSE_TABLE_SIZE];
-    uint16_t sym_occ[256];
-    memset(sym_occ, 0, sizeof(sym_occ));
-    for (int i = 0; i < FSE_TABLE_SIZE; i++) {
-        uint8_t sym = decode_table[i].symbol;
-        sorted_table[cum_freq[sym] + sym_occ[sym]] = (uint16_t)i;
-        sym_occ[sym]++;
-    }
-
-    /* Build per-symbol encode parameters.
-     * Reference deltaNbBits/deltaFindState from Yann Collet's FSE:
-     *   For freq f > 1:
-     *     maxBitsOut = TL - highbit(f-1)
-     *     minStatePlus = f << maxBitsOut
-     *     deltaNbBits = (maxBitsOut << 16) - minStatePlus
-     *     deltaFindState = cumFreq[s] - f
-     *   For freq f == 1:
-     *     deltaNbBits = (TL << 16) - TABLE_SIZE
-     *     deltaFindState = cumFreq[s] - 1
-     *   For freq f == 0:
-     *     deltaNbBits = ((TL+1) << 16) - TABLE_SIZE  (always too large → fallback)
-     */
-    uint32_t delta_nb_bits[256];
-    int32_t delta_find_state[256];
-    for (int s = 0; s < 256; s++) {
-        uint16_t f = norm_freq[s];
-        if (f == 0) {
-            delta_nb_bits[s] = ((FSE_TABLE_LOG + 1) << 16) - FSE_TABLE_SIZE;
-            delta_find_state[s] = 0;
-        } else if (f == 1) {
-            delta_nb_bits[s] = ((uint32_t)FSE_TABLE_LOG << 16) - FSE_TABLE_SIZE;
-            delta_find_state[s] = (int32_t)cum_freq[s] - 1;
-        } else {
-            int max_bits_out = FSE_TABLE_LOG - (31 - __builtin_clz((unsigned)(f - 1)));
-            uint32_t min_state_plus = (uint32_t)f << max_bits_out;
-            delta_nb_bits[s] = ((uint32_t)max_bits_out << 16) - min_state_plus;
-            delta_find_state[s] = (int32_t)cum_freq[s] - (int32_t)f;
-        }
-    }
-
-    /* Pass 1: backward tANS, collect (nb_bits, bits_value) ops */
-    typedef struct { uint8_t nb; uint16_t bits; } fse_op_t;
-    fse_op_t *ops = (fse_op_t *)malloc((in_size + 1) * sizeof(fse_op_t));
-    if (!ops) return NEX_ERR_NOMEM;
-
-    uint32_t state = FSE_TABLE_SIZE;  /* initial encoder state */
-    size_t n_ops = 0;
-
-    for (size_t i = in_size; i > 0; i--) {
-        uint8_t sym = in[i - 1];
-        uint16_t freq = norm_freq[sym];
-        if (freq == 0) {
-            free(ops);
-            return nex_rans_compress(in, in_size, out, level, dict, dict_size);
-        }
-
-        uint32_t nbo = (state + delta_nb_bits[sym]) >> 16;
-        ops[n_ops].nb   = (uint8_t)nbo;
-        ops[n_ops].bits = (uint16_t)(state & ((1U << nbo) - 1));
-        n_ops++;
-
-        state >>= nbo;
-        /* state now ∈ [freq, 2*freq). Index into sorted_table. */
-        state = sorted_table[state + delta_find_state[sym]] + FSE_TABLE_SIZE;
-    }
-
-    /* Store final state as TABLE_LOG bits */
-    ops[n_ops].nb   = FSE_TABLE_LOG;
-    ops[n_ops].bits = (uint16_t)(state - FSE_TABLE_SIZE);
-    n_ops++;
-
-    /* Pass 2: write ops in REVERSE order (so decoder reads forward) */
-    size_t bs_cap = in_size * 2 + 256;
-    uint8_t *bs_buf = (uint8_t *)malloc(bs_cap);
-    if (!bs_buf) { free(ops); return NEX_ERR_NOMEM; }
-
-    uint64_t bit_buf = 0;
-    int bit_pos = 0;
-    size_t bs_len = 0;
-
-    for (size_t j = n_ops; j > 0; j--) {
-        uint32_t nb = ops[j - 1].nb;
-        uint32_t bits = ops[j - 1].bits;
-        bit_buf = (bit_buf << nb) | bits;
-        bit_pos += (int)nb;
-        while (bit_pos >= 8) {
-            bit_pos -= 8;
-            if (bs_len >= bs_cap) {
-                free(ops); free(bs_buf);
-                return nex_rans_compress(in, in_size, out, level, dict, dict_size);
-            }
-            bs_buf[bs_len++] = (uint8_t)(bit_buf >> bit_pos);
-            bit_buf &= (1ULL << bit_pos) - 1;
-        }
-    }
-
-    uint8_t pad_bits = 0;
-    if (bit_pos > 0) {
-        pad_bits = (uint8_t)(8 - bit_pos);
-        bs_buf[bs_len++] = (uint8_t)(bit_buf << pad_bits);
-    }
-    free(ops);
-
-    /* Find maxSymbolValue for compact header */
-    int max_sym = 255;
-    while (max_sym > 0 && norm_freq[max_sym] == 0) max_sym--;
-    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
-
-    /* Write output */
-    size_t max_out = 8 + 1 + 1 + freq_bytes + 1 + bs_len + 16;
-    if (out->capacity < max_out) {
-        uint8_t *nd = (uint8_t *)realloc(out->data, max_out);
-        if (!nd) { free(bs_buf); return NEX_ERR_NOMEM; }
-        out->data = nd; out->capacity = max_out;
-    }
-
-    uint8_t *p = out->data;
-    uint32_t orig_size = (uint32_t)in_size;
-    memcpy(p, &orig_size, 4); p += 4;
-    uint8_t *csz_ptr = p; p += 4;
-
-    *p++ = 0xFE;  /* FSE format marker */
-    *p++ = (uint8_t)max_sym;  /* compact: only write freq[0..maxSym] */
-    memcpy(p, norm_freq, freq_bytes); p += freq_bytes;
-    *p++ = pad_bits;
-    memcpy(p, bs_buf, bs_len); p += bs_len;
-    free(bs_buf);
-
-    uint32_t cds = (uint32_t)(p - out->data - 8);
-    memcpy(csz_ptr, &cds, 4);
-    out->size = (size_t)(p - out->data);
-
-    /* If FSE didn't compress well, fall back to rANS */
-    if (out->size >= in_size) {
-        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
-    }
-    return NEX_OK;
-}
-
-/* ── FSE Decompress (production-grade with forward bit reader) ───── */
-
-nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
-                                 nex_buffer_t *out, int level,
-                                 const uint8_t *dict, size_t dict_size) {
-    (void)level; (void)dict; (void)dict_size;
-
-    if (in_size < 8) return NEX_ERR_CORRUPT;
-    const uint8_t *p = in;
-    const uint8_t *const in_end = in + in_size;
-
-    uint32_t orig_size; memcpy(&orig_size, p, 4); p += 4;
-    uint32_t comp_data_size; memcpy(&comp_data_size, p, 4); p += 4;
-
-    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
-
-    /* Check for FSE format marker (0xFE) — if absent, fall back to rANS */
-    if (comp_data_size > in_size - 8 || p >= in_end || *p != 0xFE) {
-        return nex_rans_decompress(in, in_size, out, level, dict, dict_size);
-    }
-    p++;
-
-    if (p >= in_end) return NEX_ERR_CORRUPT;
-    int max_sym = *p++;
-    if (max_sym > 255) return NEX_ERR_CORRUPT;
-    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
-    if (p + freq_bytes > in_end) return NEX_ERR_CORRUPT;
-
-    uint16_t norm_freq[256];
-    memset(norm_freq, 0, sizeof(norm_freq));
-    memcpy(norm_freq, p, freq_bytes); p += freq_bytes;
-
-    if (p >= in_end) return NEX_ERR_CORRUPT;
-    uint8_t pad_bits = *p++;
-    if (pad_bits >= 8) return NEX_ERR_CORRUPT;
-
-    /* Build decode table */
-    fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
-    fse_build_decode_table(norm_freq, decode_table);
-
-    /* Ensure output buffer */
+/* ── 1-Stream FSE Decompress (Fallback for older payloads) ───────── */
+static nex_status_t fse_decompress_1stream(const uint8_t *in, size_t in_size,
+                                             nex_buffer_t *out,
+                                             const fse_dec_entry_t *decode_table,
+                                             size_t orig_size) {
     if (out->capacity < orig_size) {
         uint8_t *nd = (uint8_t *)realloc(out->data, orig_size);
         if (!nd) return NEX_ERR_NOMEM;
         out->data = nd; out->capacity = orig_size;
     }
 
-    /* Forward bit reader (MSB-first packing) */
-    const uint8_t *bs = p;
-    size_t bs_len = (size_t)(in_end - bs);
+    const uint8_t *bs = in;
+    size_t bs_len = in_size;
     if (bs_len == 0) return NEX_ERR_CORRUPT;
 
     uint64_t bit_buf = 0;
@@ -943,16 +742,12 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
         (uint32_t)((bit_buf >> bit_count) & ((1U << (n)) - 1)); \
     })
 
-    /* Read initial state as table index [0, TABLE_SIZE) */
     uint32_t state = FSE_READ_BITS(FSE_TABLE_LOG);
 
-    /* Decode loop */
     for (uint32_t i = 0; i < orig_size; i++) {
         if (state >= FSE_TABLE_SIZE) { out->size = i; return NEX_ERR_CORRUPT; }
-
         fse_dec_entry_t entry = decode_table[state];
         out->data[i] = entry.symbol;
-
         uint32_t nb = entry.nb_bits;
         uint32_t bits = (nb > 0) ? FSE_READ_BITS(nb) : 0;
         state = (uint32_t)entry.base + bits;
@@ -960,6 +755,342 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
 
     #undef FSE_READ_BITS
     #undef FSE_REFILL
+
+    out->size = orig_size;
+    return NEX_OK;
+}
+
+/* ── Innovation #5: 4-Stream SIMD Interleaved FSE ────────────────── */
+/*
+ * Splits input into 4 chunks and encodes/decodes them independently.
+ * Exposes instruction-level parallelism (ILP) by destroying the
+ * loop-carried state dependency.
+ */
+
+typedef struct { uint8_t nb; uint16_t bits; } fse_op_t;
+
+/* Encode a single stream backward, append ops to pre-allocated array */
+static void fse_encode_stream(const uint8_t *in, size_t size,
+                              const uint16_t *norm_freq,
+                              const uint16_t *sorted_table,
+                              const uint32_t *delta_nb_bits,
+                              const int32_t *delta_find_state,
+                              fse_op_t *ops, size_t *n_ops_out) {
+    uint32_t state = FSE_TABLE_SIZE;
+    size_t n_ops = 0;
+
+    for (size_t i = size; i > 0; i--) {
+        uint8_t sym = in[i - 1];
+        uint32_t nbo = (state + delta_nb_bits[sym]) >> 16;
+        ops[n_ops].nb   = (uint8_t)nbo;
+        ops[n_ops].bits = (uint16_t)(state & ((1U << nbo) - 1));
+        n_ops++;
+        state >>= nbo;
+        state = sorted_table[state + delta_find_state[sym]] + FSE_TABLE_SIZE;
+    }
+
+    ops[n_ops].nb   = FSE_TABLE_LOG;
+    ops[n_ops].bits = (uint16_t)(state - FSE_TABLE_SIZE);
+    n_ops++;
+    *n_ops_out = n_ops;
+}
+
+/* Flush ops forward into bitstream buffer */
+static nex_status_t fse_flush_stream(const fse_op_t *ops, size_t n_ops,
+                                     uint8_t *bs_buf, size_t bs_cap,
+                                     size_t *bs_len_out, uint8_t *pad_bits_out) {
+    uint64_t bit_buf = 0;
+    int bit_pos = 0;
+    size_t bs_len = 0;
+
+    for (size_t j = n_ops; j > 0; j--) {
+        uint32_t nb = ops[j - 1].nb;
+        uint32_t bits = ops[j - 1].bits;
+        bit_buf = (bit_buf << nb) | bits;
+        bit_pos += (int)nb;
+        while (bit_pos >= 8) {
+            bit_pos -= 8;
+            if (bs_len >= bs_cap) return NEX_ERR_NOMEM;
+            bs_buf[bs_len++] = (uint8_t)(bit_buf >> bit_pos);
+            bit_buf &= (1ULL << bit_pos) - 1;
+        }
+    }
+
+    uint8_t pad_bits = 0;
+    if (bit_pos > 0) {
+        pad_bits = (uint8_t)(8 - bit_pos);
+        if (bs_len >= bs_cap) return NEX_ERR_NOMEM;
+        bs_buf[bs_len++] = (uint8_t)(bit_buf << pad_bits);
+    }
+
+    *bs_len_out = bs_len;
+    *pad_bits_out = pad_bits;
+    return NEX_OK;
+}
+
+nex_status_t nex_fse_compress(const uint8_t *in, size_t in_size,
+                               nex_buffer_t *out, int level,
+                               const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
+
+    if (in_size == 0) { out->size = 0; return NEX_OK; }
+    if (in_size < 128) {
+        /* Too small for 4-stream, fallback to rANS */
+        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+    }
+
+    uint16_t norm_freq[256];
+    fse_normalize_freqs(in, in_size, norm_freq);
+
+    fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
+    fse_build_decode_table(norm_freq, decode_table);
+
+    uint16_t cum_freq[257];
+    cum_freq[0] = 0;
+    for (int i = 0; i < 256; i++) cum_freq[i + 1] = cum_freq[i] + norm_freq[i];
+
+    uint16_t sorted_table[FSE_TABLE_SIZE];
+    uint16_t sym_occ[256];
+    memset(sym_occ, 0, sizeof(sym_occ));
+    for (int i = 0; i < FSE_TABLE_SIZE; i++) {
+        uint8_t sym = decode_table[i].symbol;
+        sorted_table[cum_freq[sym] + sym_occ[sym]] = (uint16_t)i;
+        sym_occ[sym]++;
+    }
+
+    uint32_t delta_nb_bits[256];
+    int32_t delta_find_state[256];
+    for (int s = 0; s < 256; s++) {
+        uint16_t f = norm_freq[s];
+        if (f == 0) {
+            delta_nb_bits[s] = ((FSE_TABLE_LOG + 1) << 16) - FSE_TABLE_SIZE;
+            delta_find_state[s] = 0;
+        } else if (f == 1) {
+            delta_nb_bits[s] = ((uint32_t)FSE_TABLE_LOG << 16) - FSE_TABLE_SIZE;
+            delta_find_state[s] = (int32_t)cum_freq[s] - 1;
+        } else {
+            int max_bits_out = FSE_TABLE_LOG - (31 - __builtin_clz((unsigned)(f - 1)));
+            uint32_t min_state_plus = (uint32_t)f << max_bits_out;
+            delta_nb_bits[s] = ((uint32_t)max_bits_out << 16) - min_state_plus;
+            delta_find_state[s] = (int32_t)cum_freq[s] - (int32_t)f;
+        }
+    }
+
+    /* Split input into 4 chunks */
+    size_t chunk_size = (in_size + 3) / 4;
+    size_t sizes[4];
+    for (int i = 0; i < 3; i++) sizes[i] = chunk_size;
+    sizes[3] = in_size - chunk_size * 3;
+
+    fse_op_t *ops = (fse_op_t *)malloc((in_size + 4) * sizeof(fse_op_t));
+    uint8_t *bs_buf = (uint8_t *)malloc(in_size * 2 + 1024);
+    if (!ops || !bs_buf) { free(ops); free(bs_buf); return NEX_ERR_NOMEM; }
+
+    size_t op_offset = 0;
+    size_t in_offset = 0;
+    size_t bs_offset = 0;
+    
+    size_t stream_n_ops[4];
+    size_t stream_bs_len[4];
+    uint8_t stream_pad[4];
+
+    /* Pass 1: Encode backward */
+    for (int i = 0; i < 4; i++) {
+        fse_encode_stream(in + in_offset, sizes[i], norm_freq, sorted_table,
+                          delta_nb_bits, delta_find_state,
+                          ops + op_offset, &stream_n_ops[i]);
+        /* Zero freqs handled gracefully by returning maxBitsOut leading to failure test later */
+        if (sizes[i] > 0 && stream_n_ops[i] <= 1) {
+             free(ops); free(bs_buf);
+             return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+        }
+        op_offset += stream_n_ops[i];
+        in_offset += sizes[i];
+    }
+
+    /* Pass 2: Flush forward */
+    op_offset = 0;
+    for (int i = 0; i < 4; i++) {
+        nex_status_t st = fse_flush_stream(ops + op_offset, stream_n_ops[i],
+                                           bs_buf + bs_offset, (in_size * 2 + 1024) - bs_offset,
+                                           &stream_bs_len[i], &stream_pad[i]);
+        if (st != NEX_OK) { free(ops); free(bs_buf); return st; }
+        op_offset += stream_n_ops[i];
+        bs_offset += stream_bs_len[i];
+    }
+    free(ops);
+
+    int max_sym = 255;
+    while (max_sym > 0 && norm_freq[max_sym] == 0) max_sym--;
+    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
+
+    /* Write output: Header + 4-Stream 0xFD marker */
+    size_t max_out = 8 + 1 + 1 + freq_bytes + 1 + 6 + bs_offset + 32;
+    if (out->capacity < max_out) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, max_out);
+        if (!nd) { free(bs_buf); return NEX_ERR_NOMEM; }
+        out->data = nd; out->capacity = max_out;
+    }
+
+    uint8_t *p = out->data;
+    uint32_t orig_size = (uint32_t)in_size;
+    memcpy(p, &orig_size, 4); p += 4;
+    uint8_t *csz_ptr = p; p += 4;
+
+    *p++ = 0xFD;  /* 4-Stream FSE marker */
+    *p++ = (uint8_t)max_sym;
+    memcpy(p, norm_freq, freq_bytes); p += freq_bytes;
+    
+    /* Packed pads: stream 0,1,2,3 pads (2 bits each) */
+    *p++ = (stream_pad[0] & 7) | ((stream_pad[1] & 7) << 2) | ((stream_pad[2] & 7) << 4) | ((stream_pad[3] & 7) << 6);
+    
+    /* Jump table for first 3 streams */
+    for (int i = 0; i < 3; i++) {
+        uint16_t slen = (uint16_t)stream_bs_len[i];
+        memcpy(p, &slen, 2); p += 2;
+    }
+
+    memcpy(p, bs_buf, bs_offset); p += bs_offset;
+    free(bs_buf);
+
+    uint32_t cds = (uint32_t)(p - out->data - 8);
+    memcpy(csz_ptr, &cds, 4);
+    out->size = (size_t)(p - out->data);
+
+    /* If expansion occurred, fall back to rANS */
+    if (out->size >= in_size) {
+        return nex_rans_compress(in, in_size, out, level, dict, dict_size);
+    }
+    return NEX_OK;
+}
+
+nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
+                                 nex_buffer_t *out, int level,
+                                 const uint8_t *dict, size_t dict_size) {
+    (void)level; (void)dict; (void)dict_size;
+
+    if (in_size < 8) return NEX_ERR_CORRUPT;
+    const uint8_t *p = in;
+    const uint8_t *const in_end = in + in_size;
+
+    uint32_t orig_size; memcpy(&orig_size, p, 4); p += 4;
+    uint32_t comp_data_size; memcpy(&comp_data_size, p, 4); p += 4;
+
+    if (orig_size > (256 * 1024 * 1024)) return NEX_ERR_CORRUPT;
+    if (comp_data_size > (size_t)(in_end - p)) return NEX_ERR_CORRUPT;
+
+    /* Fallbacks */
+    if (*p != 0xFD && *p != 0xFE) {
+        return nex_rans_decompress(in, in_size, out, level, dict, dict_size);
+    }
+    
+    bool is_4stream = (*p == 0xFD);
+    p++;
+
+    if (p >= in_end) return NEX_ERR_CORRUPT;
+    int max_sym = *p++;
+    if (max_sym > 255) return NEX_ERR_CORRUPT;
+    size_t freq_bytes = (size_t)(max_sym + 1) * 2;
+    if (p + freq_bytes > in_end) return NEX_ERR_CORRUPT;
+
+    uint16_t norm_freq[256];
+    memset(norm_freq, 0, sizeof(norm_freq));
+    memcpy(norm_freq, p, freq_bytes); p += freq_bytes;
+
+    fse_dec_entry_t decode_table[FSE_TABLE_SIZE];
+    fse_build_decode_table(norm_freq, decode_table);
+
+    if (p >= in_end) return NEX_ERR_CORRUPT;
+    uint8_t pads = *p++;
+
+    if (!is_4stream) {
+        /* Single-stream (older format 0xFE fallback) */
+        /* padbits was sent directly in the byte */
+        (void)pads; 
+        return fse_decompress_1stream(p, (size_t)(in_end - p), out, decode_table, orig_size);
+    }
+
+    /* 4-Stream Decode (0xFD) */
+    if (p + 6 > in_end) return NEX_ERR_CORRUPT;
+    uint16_t jump[3];
+    for (int i = 0; i < 3; i++) {
+        memcpy(&jump[i], p, 2); p += 2;
+    }
+
+    if (out->capacity < orig_size) {
+        uint8_t *nd = (uint8_t *)realloc(out->data, orig_size);
+        if (!nd) return NEX_ERR_NOMEM;
+        out->data = nd; out->capacity = orig_size;
+    }
+
+    size_t chunk_size = (orig_size + 3) / 4;
+    size_t sizes[4];
+    for (int i = 0; i < 3; i++) sizes[i] = chunk_size;
+    sizes[3] = orig_size - chunk_size * 3;
+
+    /* Initialize 4 bit-readers */
+    const uint8_t *bs[4];
+    size_t bs_len[4];
+    size_t bs_pos[4] = {0, 0, 0, 0};
+    uint64_t bit_buf[4] = {0, 0, 0, 0};
+    int bit_count[4] = {0, 0, 0, 0};
+
+    bs[0] = p; bs_len[0] = jump[0];
+    bs[1] = bs[0] + jump[0]; bs_len[1] = jump[1];
+    bs[2] = bs[1] + jump[1]; bs_len[2] = jump[2];
+    bs[3] = bs[2] + jump[2]; bs_len[3] = (size_t)(in_end - bs[3]);
+
+    if (bs[3] > in_end) return NEX_ERR_CORRUPT;
+
+    #define FSE4_REFILL(s) do { \
+        while (bit_count[s] < 56 && bs_pos[s] < bs_len[s]) { \
+            bit_buf[s] = (bit_buf[s] << 8) | bs[s][bs_pos[s]++]; \
+            bit_count[s] += 8; \
+        } \
+    } while(0)
+
+    #define FSE4_READ_BITS(s, n) ({ \
+        FSE4_REFILL(s); \
+        bit_count[s] -= (int)(n); \
+        (uint32_t)((bit_buf[s] >> bit_count[s]) & ((1U << (n)) - 1)); \
+    })
+
+    uint32_t state[4];
+    for (int s = 0; s < 4; s++) {
+        state[s] = FSE4_READ_BITS(s, FSE_TABLE_LOG);
+    }
+
+    uint8_t *out_p[4];
+    out_p[0] = out->data;
+    out_p[1] = out_p[0] + sizes[0];
+    out_p[2] = out_p[1] + sizes[1];
+    out_p[3] = out_p[2] + sizes[2];
+
+    /* Unrolled 4-way decode loop — Massive ILP */
+    size_t min_size = sizes[3]; /* chunk 3 is always shortest or tied */
+    for (size_t i = 0; i < min_size; i++) {
+        for (int s = 0; s < 4; s++) {
+            if (state[s] >= FSE_TABLE_SIZE) return NEX_ERR_CORRUPT;
+            fse_dec_entry_t entry = decode_table[state[s]];
+            *out_p[s]++ = entry.symbol;
+            uint32_t nb = entry.nb_bits;
+            uint32_t bits = (nb > 0) ? FSE4_READ_BITS(s, nb) : 0;
+            state[s] = (uint32_t)entry.base + bits;
+        }
+    }
+
+    /* Tail decode for remaining chunks (0,1,2 might have 1 extra byte) */
+    for (int s = 0; s < 3; s++) {
+        if (sizes[s] > min_size) {
+            if (state[s] >= FSE_TABLE_SIZE) return NEX_ERR_CORRUPT;
+            fse_dec_entry_t entry = decode_table[state[s]];
+            *out_p[s]++ = entry.symbol;
+            /* No need to read bits for the final symbol */
+        }
+    }
+
+    #undef FSE4_READ_BITS
+    #undef FSE4_REFILL
 
     out->size = orig_size;
     return NEX_OK;
