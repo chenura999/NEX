@@ -154,13 +154,14 @@ nex_status_t nex_compress(const uint8_t *input, size_t input_size,
         tasks[i].dict_data = cfg->dict_data;
         tasks[i].dict_size = cfg->dict_size;
 
-        /* Pipeline selection */
+        /* Pipeline selection — Innovation #4: Adaptive per-chunk */
         if (cfg->pipeline != NEX_PIPE_AUTO) {
             tasks[i].pipeline = cfg->pipeline;
         } else {
             nex_profile_t profile;
             nex_analyze(tasks[i].input, tasks[i].input_size, &profile);
-            tasks[i].pipeline = nex_select_pipeline(&profile, cfg->level);
+            tasks[i].pipeline = nex_adaptive_select_pipeline(
+                tasks[i].input, tasks[i].input_size, &profile, cfg->level);
         }
 
         /* Compute chunk checksum */

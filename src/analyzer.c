@@ -160,6 +160,11 @@ nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level) {
         return NEX_PIPE_FAST;
     }
 
+    /* Innovation #4: BWT excels on text data at medium+ levels */
+    if (profile->type == NEX_DATA_TEXT && profile->text_ratio > 0.90 && level >= 5) {
+        return NEX_PIPE_BWT;
+    }
+
     /* High compression request → MAX pipeline */
     if (level >= 8) {
         return NEX_PIPE_MAX;
@@ -168,3 +173,62 @@ nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level) {
     /* Default → balanced LZ pipeline */
     return NEX_PIPE_BALANCED;
 }
+
+/* ── Innovation #4: Adaptive Pipeline Fusion ─────────────────────── */
+/*
+ * At high compression levels, trial-compress a small sample through
+ * each candidate pipeline and pick the one that produces the smallest
+ * output. This brute-force auto-tuner finds the optimal pipeline per
+ * chunk instead of relying on heuristics alone.
+ *
+ * At lower levels, defers to the fast heuristic-based nex_select_pipeline.
+ */
+
+#define TRIAL_SAMPLE_SIZE 8192  /* 8KB trial sample */
+
+nex_pipeline_id_t nex_adaptive_select_pipeline(const uint8_t *data, size_t size,
+                                                 const nex_profile_t *profile,
+                                                 int level) {
+    /* Low levels → fast heuristic (no trial overhead) */
+    if (level < 7) {
+        return nex_select_pipeline(profile, level);
+    }
+
+    /* Incompressible → store immediately */
+    if (!profile->is_compressible) {
+        return NEX_PIPE_STORE;
+    }
+
+    /* Executables → always EXEC pipeline */
+    if (profile->type == NEX_DATA_EXEC) {
+        return NEX_PIPE_EXEC;
+    }
+
+    /* ── Trial compression on sample ─────────────────────────────── */
+    size_t sample_size = NEX_MIN(size, TRIAL_SAMPLE_SIZE);
+
+    /* Candidate pipelines to test */
+    nex_pipeline_id_t candidates[] = {
+        NEX_PIPE_MAX, NEX_PIPE_BWT, NEX_PIPE_BALANCED
+    };
+    int num_candidates = 3;
+
+    nex_pipeline_id_t best_pipe = NEX_PIPE_MAX;
+    size_t best_size = (size_t)-1;
+
+    for (int c = 0; c < num_candidates; c++) {
+        nex_buffer_t trial = {0};
+        /* Use level 5 for trials (fast enough for sample) */
+        nex_status_t st = nex_pipeline_compress(
+            candidates[c], data, sample_size, &trial, 5, NULL, 0);
+
+        if (st == NEX_OK && trial.size < best_size) {
+            best_size = trial.size;
+            best_pipe = candidates[c];
+        }
+        nex_buffer_free(&trial);
+    }
+
+    return best_pipe;
+}
+

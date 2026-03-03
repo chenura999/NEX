@@ -147,6 +147,9 @@ size_t       nex_available_memory(void);
 /* analyzer.c */
 void         nex_analyze(const uint8_t *data, size_t size, nex_profile_t *profile);
 nex_pipeline_id_t nex_select_pipeline(const nex_profile_t *profile, int level);
+nex_pipeline_id_t nex_adaptive_select_pipeline(const uint8_t *data, size_t size,
+                                                 const nex_profile_t *profile,
+                                                 int level);
 
 /* lz_match.c */
 nex_status_t nex_lz_compress(const uint8_t *in, size_t in_size,

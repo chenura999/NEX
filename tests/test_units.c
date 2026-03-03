@@ -79,7 +79,7 @@ static void test_analyzer(void) {
 
     nex_analyze((const uint8_t *)text, strlen(text), &profile);
     pipe = nex_select_pipeline(&profile, 6);
-    ASSERT(pipe == NEX_PIPE_BALANCED, "Text level 6 → balanced");
+    ASSERT(pipe == NEX_PIPE_BWT, "Text level 6 → bwt");
 
     pipe = nex_select_pipeline(&profile, 1);
     ASSERT(pipe == NEX_PIPE_FAST, "Level 1 → fast");
