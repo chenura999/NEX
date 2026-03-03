@@ -721,40 +721,38 @@ static nex_status_t fse_decompress_1stream(const uint8_t *in, size_t in_size,
         out->data = nd; out->capacity = orig_size;
     }
 
-    const uint8_t *bs = in;
-    size_t bs_len = in_size;
-    if (bs_len == 0) return NEX_ERR_CORRUPT;
-
+    const uint8_t *ptr = in;
+    const uint8_t *const limit = in + in_size;
     uint64_t bit_buf = 0;
     int bit_count = 0;
-    size_t bs_pos = 0;
 
-    #define FSE_REFILL() do { \
-        while (bit_count < 56 && bs_pos < bs_len) { \
-            bit_buf = (bit_buf << 8) | bs[bs_pos++]; \
+    #define FSE1_REFILL() do { \
+        while (bit_count <= 56 && ptr < limit) { \
+            bit_buf |= (uint64_t)(*ptr++) << bit_count; \
             bit_count += 8; \
         } \
     } while(0)
 
-    #define FSE_READ_BITS(n) ({ \
-        FSE_REFILL(); \
+    #define FSE1_READ_BITS(n) ({ \
+        FSE1_REFILL(); \
+        uint32_t val = (uint32_t)(bit_buf & ((1ULL << (n)) - 1)); \
+        bit_buf >>= (n); \
         bit_count -= (int)(n); \
-        (uint32_t)((bit_buf >> bit_count) & ((1U << (n)) - 1)); \
+        val; \
     })
 
-    uint32_t state = FSE_READ_BITS(FSE_TABLE_LOG);
+    uint32_t state = FSE1_READ_BITS(FSE_TABLE_LOG);
 
     for (uint32_t i = 0; i < orig_size; i++) {
-        if (state >= FSE_TABLE_SIZE) { out->size = i; return NEX_ERR_CORRUPT; }
         fse_dec_entry_t entry = decode_table[state];
         out->data[i] = entry.symbol;
         uint32_t nb = entry.nb_bits;
-        uint32_t bits = (nb > 0) ? FSE_READ_BITS(nb) : 0;
+        uint32_t bits = (nb > 0) ? FSE1_READ_BITS(nb) : 0;
         state = (uint32_t)entry.base + bits;
     }
 
-    #undef FSE_READ_BITS
-    #undef FSE_REFILL
+    #undef FSE1_READ_BITS
+    #undef FSE1_REFILL
 
     out->size = orig_size;
     return NEX_OK;
@@ -803,28 +801,29 @@ static nex_status_t fse_flush_stream(const fse_op_t *ops, size_t n_ops,
     int bit_pos = 0;
     size_t bs_len = 0;
 
+    /* Write LSB-first for faster decoding */
     for (size_t j = n_ops; j > 0; j--) {
         uint32_t nb = ops[j - 1].nb;
         uint32_t bits = ops[j - 1].bits;
-        bit_buf = (bit_buf << nb) | bits;
+        
+        bit_buf |= (uint64_t)(bits & ((1ULL << nb) - 1)) << bit_pos;
         bit_pos += (int)nb;
+        
         while (bit_pos >= 8) {
-            bit_pos -= 8;
             if (bs_len >= bs_cap) return NEX_ERR_NOMEM;
-            bs_buf[bs_len++] = (uint8_t)(bit_buf >> bit_pos);
-            bit_buf &= (1ULL << bit_pos) - 1;
+            bs_buf[bs_len++] = (uint8_t)(bit_buf & 0xFF);
+            bit_buf >>= 8;
+            bit_pos -= 8;
         }
     }
 
-    uint8_t pad_bits = 0;
     if (bit_pos > 0) {
-        pad_bits = (uint8_t)(8 - bit_pos);
         if (bs_len >= bs_cap) return NEX_ERR_NOMEM;
-        bs_buf[bs_len++] = (uint8_t)(bit_buf << pad_bits);
+        bs_buf[bs_len++] = (uint8_t)(bit_buf & 0xFF);
     }
 
     *bs_len_out = bs_len;
-    *pad_bits_out = pad_bits;
+    *pad_bits_out = (uint8_t)((8 - bit_pos) & 7);
     return NEX_OK;
 }
 
@@ -1029,35 +1028,34 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
     sizes[3] = orig_size - chunk_size * 3;
 
     /* Initialize 4 bit-readers */
-    const uint8_t *bs[4];
-    size_t bs_len[4];
-    size_t bs_pos[4] = {0, 0, 0, 0};
-    uint64_t bit_buf[4] = {0, 0, 0, 0};
-    int bit_count[4] = {0, 0, 0, 0};
+    typedef struct {
+        const uint8_t *ptr;
+        const uint8_t *limit;
+        uint64_t       bit_buf;
+        int            bit_count;
+    } fse_bit_r;
 
-    bs[0] = p; bs_len[0] = jump[0];
-    bs[1] = bs[0] + jump[0]; bs_len[1] = jump[1];
-    bs[2] = bs[1] + jump[1]; bs_len[2] = jump[2];
-    bs[3] = bs[2] + jump[2]; bs_len[3] = (size_t)(in_end - bs[3]);
+    fse_bit_r br[4];
+    br[0].ptr = p; br[0].limit = br[0].ptr + jump[0];
+    br[1].ptr = br[0].limit; br[1].limit = br[1].ptr + jump[1];
+    br[2].ptr = br[1].limit; br[2].limit = br[2].ptr + jump[2];
+    br[3].ptr = br[2].limit; br[3].limit = in_end;
 
-    if (bs[3] > in_end) return NEX_ERR_CORRUPT;
-
-    #define FSE4_REFILL(s) do { \
-        while (bit_count[s] < 56 && bs_pos[s] < bs_len[s]) { \
-            bit_buf[s] = (bit_buf[s] << 8) | bs[s][bs_pos[s]++]; \
-            bit_count[s] += 8; \
-        } \
-    } while(0)
-
-    #define FSE4_READ_BITS(s, n) ({ \
-        FSE4_REFILL(s); \
-        bit_count[s] -= (int)(n); \
-        (uint32_t)((bit_buf[s] >> bit_count[s]) & ((1U << (n)) - 1)); \
-    })
+    for (int i = 0; i < 4; i++) {
+        br[i].bit_buf = 0;
+        br[i].bit_count = 0;
+        /* Initial refill */
+        while (br[i].bit_count <= 56 && br[i].ptr < br[i].limit) {
+            br[i].bit_buf |= (uint64_t)(*br[i].ptr++) << br[i].bit_count;
+            br[i].bit_count += 8;
+        }
+    }
 
     uint32_t state[4];
-    for (int s = 0; s < 4; s++) {
-        state[s] = FSE4_READ_BITS(s, FSE_TABLE_LOG);
+    for (int i = 0; i < 4; i++) {
+        state[i] = (uint32_t)(br[i].bit_buf & (FSE_TABLE_SIZE - 1));
+        br[i].bit_buf >>= FSE_TABLE_LOG;
+        br[i].bit_count -= FSE_TABLE_LOG;
     }
 
     uint8_t *out_p[4];
@@ -1066,31 +1064,47 @@ nex_status_t nex_fse_decompress(const uint8_t *in, size_t in_size,
     out_p[2] = out_p[1] + sizes[1];
     out_p[3] = out_p[2] + sizes[2];
 
-    /* Unrolled 4-way decode loop — Massive ILP */
-    size_t min_size = sizes[3]; /* chunk 3 is always shortest or tied */
+    /* Optimized 4-stream decode loop */
+    size_t min_size = sizes[3];
     for (size_t i = 0; i < min_size; i++) {
+        /* This loop is perfectly independent across s, allowing the CPU to 
+           execute multiple state updates in parallel via ILP. */
         for (int s = 0; s < 4; s++) {
-            if (state[s] >= FSE_TABLE_SIZE) return NEX_ERR_CORRUPT;
             fse_dec_entry_t entry = decode_table[state[s]];
-            *out_p[s]++ = entry.symbol;
+            out_p[s][i] = entry.symbol;
+            
             uint32_t nb = entry.nb_bits;
-            uint32_t bits = (nb > 0) ? FSE4_READ_BITS(s, nb) : 0;
+            uint32_t bits = (uint32_t)(br[s].bit_buf & ((1U << nb) - 1));
             state[s] = (uint32_t)entry.base + bits;
+            
+            br[s].bit_buf >>= nb;
+            br[s].bit_count -= (int)nb;
+            
+            /* Refill if needed (branchless-ish or very predicted) */
+            if (NEX_UNLIKELY(br[s].bit_count < 32)) {
+                if (NEX_LIKELY(br[s].ptr + 4 <= br[s].limit)) {
+                    uint32_t next_bytes;
+                    memcpy(&next_bytes, br[s].ptr, 4);
+                    br[s].bit_buf |= (uint64_t)next_bytes << br[s].bit_count;
+                    br[s].ptr += 4;
+                    br[s].bit_count += 32;
+                } else {
+                    while (br[s].ptr < br[s].limit) {
+                        br[s].bit_buf |= (uint64_t)(*br[s].ptr++) << br[s].bit_count;
+                        br[s].bit_count += 8;
+                    }
+                }
+            }
         }
     }
 
     /* Tail decode for remaining chunks (0,1,2 might have 1 extra byte) */
     for (int s = 0; s < 3; s++) {
         if (sizes[s] > min_size) {
-            if (state[s] >= FSE_TABLE_SIZE) return NEX_ERR_CORRUPT;
             fse_dec_entry_t entry = decode_table[state[s]];
-            *out_p[s]++ = entry.symbol;
-            /* No need to read bits for the final symbol */
+            out_p[s][min_size] = entry.symbol;
         }
     }
-
-    #undef FSE4_READ_BITS
-    #undef FSE4_REFILL
 
     out->size = orig_size;
     return NEX_OK;

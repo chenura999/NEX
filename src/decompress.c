@@ -529,7 +529,6 @@ nex_status_t nex_compress_file(const char *input_path,
                                const char *output_path,
                                const nex_config_t *cfg,
                                nex_stats_t *stats) {
-    /* Read input file */
     FILE *fin = fopen(input_path, "rb");
     if (!fin) return NEX_ERR_IO;
 
@@ -538,45 +537,215 @@ nex_status_t nex_compress_file(const char *input_path,
     fseek(fin, 0, SEEK_SET);
 
     if (file_size < 0) { fclose(fin); return NEX_ERR_IO; }
-
-    uint8_t *input_data = NULL;
     size_t input_size = (size_t)file_size;
 
-    if (input_size > 0) {
-        input_data = (uint8_t *)malloc(input_size);
-        if (!input_data) { fclose(fin); return NEX_ERR_NOMEM; }
-
-        if (fread(input_data, 1, input_size, fin) != input_size) {
-            free(input_data);
-            fclose(fin);
-            return NEX_ERR_IO;
+    /* For small files under 16MB, just use the memory APIs. This natively supports
+       the micro container format and avoids complex setup. */
+    if (input_size <= 16 * 1024 * 1024) {
+        uint8_t *input_data = NULL;
+        if (input_size > 0) {
+            input_data = (uint8_t *)malloc(input_size);
+            if (!input_data) { fclose(fin); return NEX_ERR_NOMEM; }
+            if (fread(input_data, 1, input_size, fin) != input_size) {
+                free(input_data); fclose(fin); return NEX_ERR_IO;
+            }
         }
-    }
-    fclose(fin);
+        fclose(fin);
 
-    /* Compress */
-    nex_buffer_t output = {0};
-    nex_status_t st = nex_compress(input_data, input_size, &output, cfg, stats);
+        nex_buffer_t output = {0};
+        nex_status_t st = nex_compress(input_data, input_size, &output, cfg, stats);
+        free(input_data);
+        if (st != NEX_OK) { nex_buffer_free(&output); return st; }
 
-    free(input_data);
-
-    if (st != NEX_OK) {
-        nex_buffer_free(&output);
-        return st;
-    }
-
-    /* Write output file */
-    FILE *fout = fopen(output_path, "wb");
-    if (!fout) { nex_buffer_free(&output); return NEX_ERR_IO; }
-
-    if (fwrite(output.data, 1, output.size, fout) != output.size) {
+        FILE *fout = fopen(output_path, "wb");
+        if (!fout) { nex_buffer_free(&output); return NEX_ERR_IO; }
+        if (fwrite(output.data, 1, output.size, fout) != output.size) {
+            fclose(fout); nex_buffer_free(&output); return NEX_ERR_IO;
+        }
         fclose(fout);
         nex_buffer_free(&output);
-        return NEX_ERR_IO;
+        return NEX_OK;
     }
 
+    /* V2 Upgrade: Streaming Block IO Multi-Threading */
+    FILE *fout = fopen(output_path, "wb+");
+    if (!fout) { fclose(fin); return NEX_ERR_IO; }
+
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+    size_t chunk_size = cfg->chunk_size;
+    if (chunk_size == NEX_DEFAULT_CHUNK_SIZE) {
+        if (cfg->level <= 3) chunk_size = 4 * 1024 * 1024;
+        else if (cfg->level <= 6) chunk_size = 8 * 1024 * 1024;
+        else chunk_size = 16 * 1024 * 1024;
+    }
+    if (chunk_size < NEX_MIN_CHUNK_SIZE) chunk_size = NEX_MIN_CHUNK_SIZE;
+    if (chunk_size > NEX_MAX_CHUNK_SIZE) chunk_size = NEX_MAX_CHUNK_SIZE;
+
+    uint32_t num_chunks = (uint32_t)((input_size + chunk_size - 1) / chunk_size);
+    int num_threads = cfg->threads;
+    if (num_threads == 0) {
+        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (ncpus > 0) ? (int)ncpus : 1;
+    }
+
+    size_t header_size = 30;
+    size_t table_size = (size_t)num_chunks * 21; /* 21 bytes per entry physically */
+    size_t data_offset = header_size + table_size;
+
+    /* Pre-allocate header and table layout */
+    if (fseek(fout, data_offset, SEEK_SET) != 0) {
+        fclose(fin); fclose(fout); return NEX_ERR_IO;
+    }
+
+    nex_chunk_entry_t *entries = (nex_chunk_entry_t *)calloc(num_chunks, sizeof(nex_chunk_entry_t));
+    if (!entries) { fclose(fin); fclose(fout); return NEX_ERR_NOMEM; }
+
+    nex_xxh64_state_t full_checksum_state;
+    nex_xxh64_init(&full_checksum_state, 0);
+
+    nex_thread_pool_t *pool = NULL;
+    if (num_threads > 1) {
+        pool = nex_pool_create(num_threads);
+        if (!pool) num_threads = 1; /* Fallback */
+    }
+
+    uint64_t cur_offset = data_offset;
+    size_t total_compressed = 0;
+    nex_status_t loop_st = NEX_OK;
+
+    int batch_size = num_threads;
+    if (batch_size < 1) batch_size = 1;
+
+    nex_chunk_task_t *tasks = (nex_chunk_task_t *)calloc(batch_size, sizeof(nex_chunk_task_t));
+    if (!tasks) {
+        if (pool) nex_pool_destroy(pool);
+        free(entries); fclose(fin); fclose(fout); return NEX_ERR_NOMEM;
+    }
+
+    for (uint32_t batch_start = 0; batch_start < num_chunks; batch_start += (uint32_t)batch_size) {
+        int active = (int)NEX_MIN((uint32_t)batch_size, num_chunks - batch_start);
+
+        for (int i = 0; i < active; i++) {
+            uint32_t chunk_idx = batch_start + i;
+            size_t bytes_to_read = NEX_MIN(chunk_size, input_size - ((size_t)chunk_idx * chunk_size));
+            
+            tasks[i].input_size = bytes_to_read;
+            tasks[i].input = (uint8_t *)malloc(bytes_to_read);
+            if (!tasks[i].input) { loop_st = NEX_ERR_NOMEM; break; }
+
+            if (fread((void*)tasks[i].input, 1, bytes_to_read, fin) != bytes_to_read) {
+                loop_st = NEX_ERR_IO; break;
+            }
+
+            nex_xxh64_update(&full_checksum_state, tasks[i].input, bytes_to_read);
+
+            tasks[i].level = cfg->level;
+            tasks[i].is_compress = true;
+            tasks[i].dict_data = cfg->dict_data;
+            tasks[i].dict_size = cfg->dict_size;
+
+            if (cfg->pipeline != NEX_PIPE_AUTO) {
+                tasks[i].pipeline = cfg->pipeline;
+            } else {
+                nex_profile_t profile;
+                nex_analyze(tasks[i].input, tasks[i].input_size, &profile);
+                tasks[i].pipeline = nex_adaptive_select_pipeline(tasks[i].input, tasks[i].input_size, &profile, cfg->level);
+            }
+
+            tasks[i].original_checksum = nex_xxh32(tasks[i].input, bytes_to_read, 0);
+            
+            if (pool) nex_pool_submit(pool, chunk_compress_fn, &tasks[i]);
+            else chunk_compress_fn(&tasks[i]);
+        }
+        
+        if (loop_st != NEX_OK) break;
+
+        if (pool) nex_pool_wait(pool);
+
+        for (int i = 0; i < active; i++) {
+            if (tasks[i].status != NEX_OK) { loop_st = tasks[i].status; }
+        }
+        if (loop_st != NEX_OK) break;
+
+        /* Write outputs, update table, free memory */
+        for (int i = 0; i < active; i++) {
+            uint32_t chunk_idx = batch_start + i;
+            if (fwrite(tasks[i].output.data, 1, tasks[i].output.size, fout) != tasks[i].output.size) {
+                loop_st = NEX_ERR_IO;
+            }
+            
+            entries[chunk_idx].compressed_offset = cur_offset;
+            entries[chunk_idx].compressed_size = (uint32_t)tasks[i].output.size;
+            entries[chunk_idx].original_size = (uint32_t)tasks[i].input_size;
+            entries[chunk_idx].pipeline_id = (uint8_t)tasks[i].pipeline;
+            entries[chunk_idx].checksum = tasks[i].original_checksum;
+            
+            cur_offset += tasks[i].output.size;
+            total_compressed += tasks[i].output.size;
+            
+            free((void*)tasks[i].input);
+            tasks[i].input = NULL;
+            nex_buffer_free(&tasks[i].output);
+        }
+        if (loop_st != NEX_OK) break;
+    }
+
+    /* Cleanup remaining error state buffers */
+    if (loop_st != NEX_OK) {
+        for (int i = 0; i < batch_size; i++) {
+            if (tasks[i].input) free((void*)tasks[i].input);
+            if (tasks[i].output.data) nex_buffer_free(&tasks[i].output);
+        }
+        if (pool) nex_pool_destroy(pool);
+        free(tasks); free(entries);
+        fclose(fin); fclose(fout);
+        return loop_st;
+    }
+
+    if (pool) nex_pool_destroy(pool);
+    free(tasks);
+    fclose(fin);
+
+    uint32_t footer = 0x014E4558U; /* "XEN\x01" LE */
+    if (fwrite(&footer, 1, 4, fout) != 4) { free(entries); fclose(fout); return NEX_ERR_IO; }
+
+    /* Write Header & Chunk Table */
+    uint64_t full_checksum_res = nex_xxh64_digest(&full_checksum_state);
+    fseek(fout, 0, SEEK_SET);
+
+    nex_header_t hdr = {
+        .magic = NEX_MAGIC,
+        .version = NEX_FORMAT_VER,
+        .flags = 0,
+        .original_size = input_size,
+        .chunk_count = num_chunks,
+        .checksum = full_checksum_res,
+    };
+    
+    nex_buffer_t hbuf = {0};
+    nex_write_header(&hbuf, &hdr);
+    nex_write_chunk_table(&hbuf, entries, num_chunks);
+    
+    if (fwrite(hbuf.data, 1, hbuf.size, fout) != hbuf.size) {
+        nex_buffer_free(&hbuf); free(entries); fclose(fout); return NEX_ERR_IO;
+    }
+    nex_buffer_free(&hbuf);
+    free(entries);
     fclose(fout);
-    nex_buffer_free(&output);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    if (stats) {
+        double elapsed = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0 +
+                          (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
+        stats->original_size = input_size;
+        stats->compressed_size = data_offset + total_compressed + 4;
+        stats->ratio = (double)stats->compressed_size / (double)input_size;
+        stats->compress_time_ms = elapsed;
+        stats->compress_speed_mbs = (input_size / (1024.0 * 1024.0)) / (elapsed / 1000.0);
+    }
+
     return NEX_OK;
 }
 
@@ -584,7 +753,6 @@ nex_status_t nex_decompress_file(const char *input_path,
                                  const char *output_path,
                                  const nex_config_t *cfg,
                                  nex_stats_t *stats) {
-    /* Read input file */
     FILE *fin = fopen(input_path, "rb");
     if (!fin) return NEX_ERR_IO;
 
@@ -594,39 +762,198 @@ nex_status_t nex_decompress_file(const char *input_path,
 
     if (file_size <= 0) { fclose(fin); return NEX_ERR_IO; }
 
-    size_t input_size = (size_t)file_size;
-    uint8_t *input_data = (uint8_t *)malloc(input_size);
-    if (!input_data) { fclose(fin); return NEX_ERR_NOMEM; }
+    /* For small files under 16MB, just use the memory APIs. */
+    if (file_size <= 16 * 1024 * 1024) {
+        size_t input_size = (size_t)file_size;
+        uint8_t *input_data = (uint8_t *)malloc(input_size);
+        if (!input_data) { fclose(fin); return NEX_ERR_NOMEM; }
 
-    if (fread(input_data, 1, input_size, fin) != input_size) {
-        free(input_data);
+        if (fread(input_data, 1, input_size, fin) != input_size) {
+            free(input_data); fclose(fin); return NEX_ERR_IO;
+        }
         fclose(fin);
-        return NEX_ERR_IO;
-    }
-    fclose(fin);
 
-    /* Decompress */
-    nex_buffer_t output = {0};
-    nex_status_t st = nex_decompress(input_data, input_size, &output, cfg, stats);
+        nex_buffer_t output = {0};
+        nex_status_t st = nex_decompress(input_data, input_size, &output, cfg, stats);
+        free(input_data);
+        if (st != NEX_OK) { nex_buffer_free(&output); return st; }
 
-    free(input_data);
-
-    if (st != NEX_OK) {
-        nex_buffer_free(&output);
-        return st;
-    }
-
-    /* Write output */
-    FILE *fout = fopen(output_path, "wb");
-    if (!fout) { nex_buffer_free(&output); return NEX_ERR_IO; }
-
-    if (fwrite(output.data, 1, output.size, fout) != output.size) {
+        FILE *fout = fopen(output_path, "wb");
+        if (!fout) { nex_buffer_free(&output); return NEX_ERR_IO; }
+        if (fwrite(output.data, 1, output.size, fout) != output.size) {
+            fclose(fout); nex_buffer_free(&output); return NEX_ERR_IO;
+        }
         fclose(fout);
         nex_buffer_free(&output);
-        return NEX_ERR_IO;
+        return NEX_OK;
     }
 
-    fclose(fout);
-    nex_buffer_free(&output);
+    /* Streaming Block IO Decompress */
+    size_t input_size = (size_t)file_size;
+    uint8_t header_buf[30]; /* NEX_HEADER_SIZE */
+    if (fread(header_buf, 1, 30, fin) != 30) {
+        fclose(fin); return NEX_ERR_IO;
+    }
+
+    nex_header_t hdr;
+    nex_status_t st = nex_read_header(header_buf, 30, &hdr);
+    if (st != NEX_OK) { fclose(fin); return st; }
+
+    /* Micro format bypass */
+    if (hdr.flags & 0x0001) { /* NEX_FLAG_MICRO */
+        fseek(fin, 0, SEEK_SET);
+        uint8_t *input_data = (uint8_t *)malloc(input_size);
+        if (!input_data) { fclose(fin); return NEX_ERR_NOMEM; }
+        if (fread(input_data, 1, input_size, fin) != input_size) {
+            free(input_data); fclose(fin); return NEX_ERR_IO;
+        }
+        fclose(fin);
+        nex_buffer_t output = {0};
+        st = nex_decompress(input_data, input_size, &output, cfg, stats);
+        free(input_data);
+        if (st != NEX_OK) { nex_buffer_free(&output); return st; }
+
+        FILE *fout = fopen(output_path, "wb");
+        if (!fout) { nex_buffer_free(&output); return NEX_ERR_IO; }
+        if (fwrite(output.data, 1, output.size, fout) != output.size) {
+            fclose(fout); nex_buffer_free(&output); return NEX_ERR_IO;
+        }
+        fclose(fout); nex_buffer_free(&output); return NEX_OK;
+    }
+
+    size_t table_size = (size_t)hdr.chunk_count * 21; /* 21 bytes physical mapping */
+    uint8_t *table_buf = (uint8_t *)malloc(table_size);
+    if (!table_buf) { fclose(fin); return NEX_ERR_NOMEM; }
+
+    if (fread(table_buf, 1, table_size, fin) != table_size) {
+        free(table_buf); fclose(fin); return NEX_ERR_IO;
+    }
+
+    nex_chunk_entry_t *entries = NULL;
+    st = nex_read_chunk_table(table_buf, table_size, &entries, hdr.chunk_count);
+    free(table_buf);
+    if (st != NEX_OK) { fclose(fin); return st; }
+
+    FILE *fout = fopen(output_path, "wb");
+    if (!fout) { free(entries); fclose(fin); return NEX_ERR_IO; }
+
+    struct timespec ts_start, ts_end;
+    clock_gettime(CLOCK_MONOTONIC, &ts_start);
+
+    nex_xxh64_state_t full_checksum_state;
+    nex_xxh64_init(&full_checksum_state, 0);
+
+    int num_threads = cfg->threads;
+    if (num_threads <= 0) {
+        long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+        num_threads = (ncpus > 0) ? (int)ncpus : 1;
+    }
+    
+    nex_thread_pool_t *pool = NULL;
+    if (num_threads > 1 && hdr.chunk_count > 1) {
+        pool = nex_pool_create(num_threads);
+        if (!pool) num_threads = 1;
+    }
+
+    nex_status_t loop_st = NEX_OK;
+    int batch_size = num_threads;
+    if (batch_size < 1) batch_size = 1;
+
+    nex_chunk_task_t *tasks = (nex_chunk_task_t *)calloc(batch_size, sizeof(nex_chunk_task_t));
+    if (!tasks) {
+        if (pool) nex_pool_destroy(pool);
+        free(entries); fclose(fin); fclose(fout); return NEX_ERR_NOMEM;
+    }
+
+    for (uint32_t batch_start = 0; batch_start < hdr.chunk_count; batch_start += (uint32_t)batch_size) {
+        int active = (int)NEX_MIN((uint32_t)batch_size, hdr.chunk_count - batch_start);
+
+        for (int i = 0; i < active; i++) {
+            uint32_t chunk_idx = batch_start + i;
+            nex_chunk_entry_t *e = &entries[chunk_idx];
+            
+            if (fseek(fin, e->compressed_offset, SEEK_SET) != 0) {
+                loop_st = NEX_ERR_IO; break;
+            }
+
+            tasks[i].input_size = e->compressed_size;
+            tasks[i].input = (uint8_t *)malloc(e->compressed_size);
+            if (!tasks[i].input) { loop_st = NEX_ERR_NOMEM; break; }
+
+            if (fread((void*)tasks[i].input, 1, e->compressed_size, fin) != e->compressed_size) {
+                loop_st = NEX_ERR_IO; break;
+            }
+
+            tasks[i].pipeline = (nex_pipeline_id_t)e->pipeline_id;
+            tasks[i].level = NEX_LEVEL_DEFAULT;
+            tasks[i].original_checksum = e->checksum;
+            tasks[i].is_compress = false;
+            tasks[i].dict_data = cfg->dict_data;
+            tasks[i].dict_size = cfg->dict_size;
+            
+            if (pool) nex_pool_submit(pool, chunk_decompress_fn, &tasks[i]);
+            else chunk_decompress_fn(&tasks[i]);
+        }
+
+        if (loop_st != NEX_OK) break;
+
+        if (pool) nex_pool_wait(pool);
+
+        for (int i = 0; i < active; i++) {
+            if (tasks[i].status != NEX_OK) { loop_st = tasks[i].status; }
+        }
+        if (loop_st != NEX_OK) break;
+
+        for (int i = 0; i < active; i++) {
+            uint32_t computed = nex_xxh32(tasks[i].output.data, tasks[i].output.size, 0);
+            if (computed != tasks[i].original_checksum) {
+                loop_st = NEX_ERR_CHECKSUM; break;
+            }
+
+            if (fwrite(tasks[i].output.data, 1, tasks[i].output.size, fout) != tasks[i].output.size) {
+                loop_st = NEX_ERR_IO; break;
+            }
+
+            nex_xxh64_update(&full_checksum_state, tasks[i].output.data, tasks[i].output.size);
+            
+            free((void*)tasks[i].input);
+            tasks[i].input = NULL;
+            nex_buffer_free(&tasks[i].output);
+        }
+        if (loop_st != NEX_OK) break;
+    }
+
+    /* Error handling */
+    if (loop_st != NEX_OK) {
+        for (int i = 0; i < batch_size; i++) {
+            if (tasks[i].input) free((void*)tasks[i].input);
+            if (tasks[i].output.data) nex_buffer_free(&tasks[i].output);
+        }
+        if (pool) nex_pool_destroy(pool);
+        free(tasks); free(entries);
+        fclose(fin); fclose(fout);
+        return loop_st;
+    }
+
+    if (pool) nex_pool_destroy(pool);
+    free(tasks); free(entries);
+    fclose(fin); fclose(fout);
+
+    uint64_t full_checksum_res = nex_xxh64_digest(&full_checksum_state);
+    if (full_checksum_res != hdr.checksum) {
+        return NEX_ERR_CHECKSUM;
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &ts_end);
+    if (stats) {
+        double elapsed = (ts_end.tv_sec - ts_start.tv_sec) * 1000.0 +
+                          (ts_end.tv_nsec - ts_start.tv_nsec) / 1e6;
+        stats->original_size = hdr.original_size;
+        stats->compressed_size = input_size;
+        stats->ratio = (double)input_size / (double)hdr.original_size;
+        stats->decompress_time_ms = elapsed;
+        stats->decompress_speed_mbs = (hdr.original_size / (1024.0 * 1024.0)) / (elapsed / 1000.0);
+    }
+
     return NEX_OK;
 }

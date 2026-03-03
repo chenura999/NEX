@@ -15,94 +15,143 @@
  *   [N bytes] BWT output
  * ═══════════════════════════════════════════════════════════════════ */
 
-/* ── Suffix Array via Radix Prefix Doubling: O(n log n) ──────── */
+/* ── SA-IS (Linear Time O(N) Suffix Array) ─────────────── */
 
-/* O(n) Stable Radix Sort Pass */
-static void radix_pass(int *sa_in, int *sa_out, const int *rank, int offset, int n, int K) {
-    int *count = (int *)calloc(K + 2, sizeof(int));
-    if (!count) return;
+#define CHR(i) (cs == sizeof(int) ? ((int*)s)[i] : ((const uint8_t*)s)[i])
 
-    for (int i = 0; i < n; i++) {
-        int r = rank[(sa_in[i] + offset) % n];
-        count[r + 1]++;
-    }
-
-    for (int i = 1; i <= K; i++) {
-        count[i] += count[i - 1];
-    }
-
-    for (int i = 0; i < n; i++) {
-        int r = rank[(sa_in[i] + offset) % n];
-        sa_out[count[r]++] = sa_in[i];
-    }
-
-    free(count);
+static void getCounts(const void *s, int *c, int n, int k, int cs) {
+    for (int i = 0; i < k; i++) c[i] = 0;
+    for (int i = 0; i < n; i++) c[CHR(i)]++;
 }
 
-static void build_suffix_array(const uint8_t *data, size_t n,
-                                uint32_t *sa_out) {
-    int nn = (int)n;
+static void getBuckets(const int *c, int *b, int k, int end) {
+    int sum = 0;
+    if (end) { for (int i = 0; i < k; i++) { sum += c[i]; b[i] = sum; } }
+    else     { for (int i = 0; i < k; i++) { b[i] = sum; sum += c[i]; } }
+}
 
-    int *sa   = (int *)malloc(nn * sizeof(int));
-    int *rank = (int *)malloc(nn * sizeof(int));
-    int *tmp  = (int *)malloc(nn * sizeof(int));
-    int *tmp_sa = (int *)malloc(nn * sizeof(int));
+static void induceSA(const uint8_t *t, int *SA, const void *s, int *c, int *b, int n, int k, int cs) {
+    int i, j;
+    getBuckets(c, b, k, 0); /* head */
+    for (i = 0; i < n; i++) {
+        j = SA[i] - 1;
+        if (j >= 0 && !(t[j >> 3] & (1 << (j & 7)))) SA[b[CHR(j)]++] = j;
+    }
+    getBuckets(c, b, k, 1); /* tail */
+    for (i = n - 1; i >= 0; i--) {
+        j = SA[i] - 1;
+        if (j >= 0 && (t[j >> 3] & (1 << (j & 7)))) SA[--b[CHR(j)]] = j;
+    }
+}
 
-    if (!sa || !rank || !tmp || !tmp_sa) {
-        for (int i = 0; i < nn; i++) sa_out[i] = (uint32_t)i;
-        free(sa); free(rank); free(tmp); free(tmp_sa);
-        return;
+static void SA_IS(const void *s, int *SA, int n, int k, int cs) {
+    int i, j;
+    uint8_t *t = (uint8_t *)calloc((n >> 3) + 1, 1);
+    if (!t) return;
+    
+    t[(n - 1) >> 3] |= (1 << ((n - 1) & 7));
+    for (i = n - 2; i >= 0; i--) {
+        int c1 = CHR(i), c2 = CHR(i + 1);
+        if (c1 < c2 || (c1 == c2 && (t[(i + 1) >> 3] & (1 << ((i + 1) & 7)))))
+            t[i >> 3] |= (1 << (i & 7));
     }
 
-    /* Initialize SA and ranks */
-    int K = 255;
-    for (int i = 0; i < nn; i++) {
-        sa[i] = i;
-        rank[i] = (int)data[i];
+    int *c = (int *)malloc(k * sizeof(int));
+    int *b = (int *)malloc(k * sizeof(int));
+    if (!c || !b) { free(t); free(c); free(b); return; }
+
+    getCounts(s, c, n, k, cs);
+    getBuckets(c, b, k, 1);
+    for (i = 0; i < n; i++) SA[i] = -1;
+    for (i = 1; i < n; i++) {
+        if ((t[i >> 3] & (1 << (i & 7))) && !(t[(i - 1) >> 3] & (1 << ((i - 1) & 7))))
+            SA[--b[CHR(i)]] = i;
+    }
+    induceSA(t, SA, s, c, b, n, k, cs);
+
+    int n1 = 0;
+    for (i = 0; i < n; i++) {
+        int p = SA[i];
+        if (p > 0 && (t[p >> 3] & (1 << (p & 7))) && !(t[(p - 1) >> 3] & (1 << ((p - 1) & 7))))
+            SA[n1++] = p;
     }
 
-    for (int k = 1; k < nn; k <<= 1) {
-        /* Radix Sort in 2 passes: Low half (rank[i+k]), then High half (rank[i]) */
-        radix_pass(sa, tmp_sa, rank, k, nn, K);
-        radix_pass(tmp_sa, sa, rank, 0, nn, K);
-
-        /* Recompute ranks based on sorted order */
-        tmp[sa[0]] = 0;
-        int current_k = 0;
-        for (int i = 1; i < nn; i++) {
-            int p = sa[i - 1];
-            int c = sa[i];      /* current suffix */
-
-            int pr1 = rank[p];
-            int pr2 = rank[(p + k) % nn];
-            int cr1 = rank[c];
-            int cr2 = rank[(c + k) % nn];
-
-            if (cr1 == pr1 && cr2 == pr2) {
-                tmp[c] = tmp[p];
-            } else {
-                tmp[c] = tmp[p] + 1;
-                current_k++;
+    for (i = n1; i < n; i++) SA[i] = -1;
+    int name = 0, prev = -1;
+    for (i = 0; i < n1; i++) {
+        int pos = SA[i], diff = 0;
+        for (int d = 0; d < n; d++) {
+            if (prev == -1 || CHR(pos + d) != CHR(prev + d) || 
+                (!!(t[(pos + d) >> 3] & (1 << ((pos + d) & 7))) != !!(t[(prev + d) >> 3] & (1 << ((prev + d) & 7))))) {
+                diff = 1; break;
             }
+            if (d > 0 && (t[(pos + d) >> 3] & (1 << ((pos + d) & 7))) && !(t[(pos + d - 1) >> 3] & (1 << ((pos + d - 1) & 7))))
+                break;
         }
+        if (diff) { name++; prev = pos; }
+        pos = (pos >> 1);
+        SA[n1 + pos] = name - 1;
+    }
+    
+    j = n - 1;
+    for (i = n - 1; i >= n1; i--) { if (SA[i] >= 0) SA[j--] = SA[i]; }
 
-        /* Swap rank and tmp */
-        memcpy(rank, tmp, nn * sizeof(int));
-        K = current_k;
-
-        /* All ranks unique → done */
-        if (rank[sa[nn - 1]] == nn - 1) break;
+    int *SA1 = SA, *s1 = SA + n - n1;
+    if (name < n1) {
+        SA_IS(s1, SA1, n1, name, sizeof(int));
+    } else {
+        for (i = 0; i < n1; i++) SA1[s1[i]] = i;
     }
 
-    /* Copy int SA → uint32_t output */
-    for (int i = 0; i < nn; i++)
-        sa_out[i] = (uint32_t)sa[i];
+    getBuckets(c, b, k, 1);
+    for (i = 1, j = 0; i < n; i++) {
+        if ((t[i >> 3] & (1 << (i & 7))) && !(t[(i - 1) >> 3] & (1 << ((i - 1) & 7))))
+            s1[j++] = i;
+    }
+    for (i = 0; i < n1; i++) SA1[i] = s1[SA1[i]];
+    for (i = n1; i < n; i++) SA[i] = -1;
+    for (i = n1 - 1; i >= 0; i--) {
+        j = SA[i]; SA[i] = -1;
+        SA[--b[CHR(j)]] = j;
+    }
+    induceSA(t, SA, s, c, b, n, k, cs);
 
-    free(sa);
-    free(rank);
-    free(tmp);
-    free(tmp_sa);
+    free(c); free(b); free(t);
 }
+
+static void build_suffix_array(const uint8_t *data, size_t n, uint32_t *sa_out) {
+    if (n == 0) return;
+    
+    // We use String Doubling to accurately simulate CYCLIC shift string sorting (BWT)
+    size_t nn = n * 2;
+    int *SA = (int *)malloc((nn + 1) * sizeof(int));
+    int *data_pad = (int *)malloc((nn + 1) * sizeof(int));
+    
+    if (!SA || !data_pad) { free(SA); free(data_pad); return; }
+    
+    // Pad characters (+1) to reserve 0 as the strict EOF sentinel
+    for(size_t i = 0; i < n; i++) {
+        data_pad[i] = data[i] + 1;
+        data_pad[i + n] = data[i] + 1;
+    }
+    data_pad[nn] = 0;
+
+    SA_IS(data_pad, SA, nn + 1, 257, sizeof(int));
+    
+    // Extract the original N cyclic suffixes (those whose starting index < N)
+    size_t j = 0;
+    for (size_t i = 0; i <= nn; i++) {
+        if (SA[i] < (int)n) {
+            sa_out[j++] = (uint32_t)SA[i];
+            if (j == n) break;
+        }
+    }
+    
+    free(SA);
+    free(data_pad);
+}
+
+
 
 nex_status_t nex_bwt_forward(const uint8_t *in, size_t in_size,
                               nex_buffer_t *out, int level, const uint8_t *dict, size_t dict_size) {

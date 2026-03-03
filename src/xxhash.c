@@ -172,3 +172,101 @@ uint64_t nex_xxh64(const void *data, size_t len, uint64_t seed) {
 
     return h64;
 }
+
+/* ── XXH64 Streaming API ─────────────────────────────────────────── */
+
+void nex_xxh64_init(nex_xxh64_state_t *state, uint64_t seed) {
+    memset(state, 0, sizeof(*state));
+    state->v1 = seed + XXH_PRIME64_1 + XXH_PRIME64_2;
+    state->v2 = seed + XXH_PRIME64_2;
+    state->v3 = seed;
+    state->v4 = seed - XXH_PRIME64_1;
+    state->seed = seed;
+}
+
+void nex_xxh64_update(nex_xxh64_state_t *state, const void *data, size_t len) {
+    const uint8_t *p = (const uint8_t *)data;
+    const uint8_t *end = p + len;
+
+    state->total_len += len;
+
+    if (state->memsize + len < 32) {
+        memcpy(state->mem + state->memsize, p, len);
+        state->memsize += (uint32_t)len;
+        return;
+    }
+
+    if (state->memsize > 0) {
+        size_t fill = 32 - state->memsize;
+        memcpy(state->mem + state->memsize, p, fill);
+        state->v1 = xxh64_round(state->v1, xxh64_read64(state->mem));
+        state->v2 = xxh64_round(state->v2, xxh64_read64(state->mem + 8));
+        state->v3 = xxh64_round(state->v3, xxh64_read64(state->mem + 16));
+        state->v4 = xxh64_round(state->v4, xxh64_read64(state->mem + 24));
+        p += fill;
+        state->memsize = 0;
+    }
+
+    while (p + 32 <= end) {
+        state->v1 = xxh64_round(state->v1, xxh64_read64(p));
+        state->v2 = xxh64_round(state->v2, xxh64_read64(p + 8));
+        state->v3 = xxh64_round(state->v3, xxh64_read64(p + 16));
+        state->v4 = xxh64_round(state->v4, xxh64_read64(p + 24));
+        p += 32;
+    }
+
+    if (p < end) {
+        memcpy(state->mem, p, end - p);
+        state->memsize = (uint32_t)(end - p);
+    }
+}
+
+uint64_t nex_xxh64_digest(const nex_xxh64_state_t *state) {
+    uint64_t h64;
+
+    if (state->total_len >= 32) {
+        h64 = xxh64_rotl(state->v1, 1) + xxh64_rotl(state->v2, 7) +
+              xxh64_rotl(state->v3, 12) + xxh64_rotl(state->v4, 18);
+
+        h64 = xxh64_merge_round(h64, state->v1);
+        h64 = xxh64_merge_round(h64, state->v2);
+        h64 = xxh64_merge_round(h64, state->v3);
+        h64 = xxh64_merge_round(h64, state->v4);
+    } else {
+        h64 = state->seed + XXH_PRIME64_5;
+    }
+
+    h64 += state->total_len;
+
+    const uint8_t *p = state->mem;
+    const uint8_t *end = p + state->memsize;
+
+    while (p + 8 <= end) {
+        uint64_t k1 = xxh64_round(0, xxh64_read64(p));
+        h64 ^= k1;
+        h64 = xxh64_rotl(h64, 27) * XXH_PRIME64_1 + XXH_PRIME64_4;
+        p += 8;
+    }
+
+    if (p + 4 <= end) {
+        uint32_t v32;
+        memcpy(&v32, p, 4);
+        h64 ^= (uint64_t)v32 * XXH_PRIME64_1;
+        h64 = xxh64_rotl(h64, 23) * XXH_PRIME64_2 + XXH_PRIME64_3;
+        p += 4;
+    }
+
+    while (p < end) {
+        h64 ^= (*p) * XXH_PRIME64_5;
+        h64 = xxh64_rotl(h64, 11) * XXH_PRIME64_1;
+        p++;
+    }
+
+    h64 ^= h64 >> 33;
+    h64 *= XXH_PRIME64_2;
+    h64 ^= h64 >> 29;
+    h64 *= XXH_PRIME64_3;
+    h64 ^= h64 >> 32;
+
+    return h64;
+}

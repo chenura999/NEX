@@ -244,6 +244,18 @@ nex_status_t nex_read_chunk_table(const uint8_t *data, size_t size,
 uint32_t nex_xxh32(const void *data, size_t len, uint32_t seed);
 uint64_t nex_xxh64(const void *data, size_t len, uint64_t seed);
 
+typedef struct {
+    uint64_t total_len;
+    uint64_t v1, v2, v3, v4;
+    uint64_t seed;
+    uint8_t  mem[32];
+    uint32_t memsize;
+} nex_xxh64_state_t;
+
+void nex_xxh64_init(nex_xxh64_state_t *state, uint64_t seed);
+void nex_xxh64_update(nex_xxh64_state_t *state, const void *data, size_t len);
+uint64_t nex_xxh64_digest(const nex_xxh64_state_t *state);
+
 /* parallel.c */
 typedef struct nex_thread_pool nex_thread_pool_t;
 nex_thread_pool_t *nex_pool_create(int num_threads);

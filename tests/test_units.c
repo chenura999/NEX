@@ -230,6 +230,36 @@ static void test_rans(void) {
     nex_buffer_free(&decompressed);
 }
 
+/* ── FSE Entropy Tests ───────────────────────────────────────────── */
+static void test_fse(void) {
+    printf("\n=== FSE Entropy Tests ===\n");
+
+    /* Test 4-stream FSE logic */
+    const char *text = "the quick brown fox jumps over the lazy dog. 1234567890.";
+    size_t repeat = 20;
+    size_t len = strlen(text) * repeat;
+    uint8_t *data = (uint8_t *)malloc(len);
+    for (size_t i = 0; i < repeat; i++) {
+        memcpy(data + i * strlen(text), text, strlen(text));
+    }
+
+    nex_buffer_t compressed = {0}, decompressed = {0};
+
+    /* Level 6 should use balanced pipeline which uses FSE if data is right */
+    /* But we call nex_fse_compress directly to be sure */
+    nex_status_t st = nex_fse_compress(data, len, &compressed, 6, NULL, 0);
+    ASSERT(st == NEX_OK, "FSE compress ok");
+
+    st = nex_fse_decompress(compressed.data, compressed.size, &decompressed, 6, NULL, 0);
+    ASSERT(st == NEX_OK, "FSE decompress ok");
+    ASSERT(decompressed.size == len, "FSE size matches");
+    ASSERT(memcmp(decompressed.data, data, len) == 0, "FSE round-trip");
+
+    nex_buffer_free(&compressed);
+    nex_buffer_free(&decompressed);
+    free(data);
+}
+
 /* ── Container Tests ─────────────────────────────────────────────── */
 static void test_container(void) {
     printf("\n=== Container Tests ===\n");
@@ -402,6 +432,7 @@ int main(void) {
     test_bwt();
     test_delta();
     test_rans();
+    test_fse();
     test_container();
     test_pipelines();
     test_full_api();
